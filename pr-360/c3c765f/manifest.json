@@ -1,0 +1,46 @@
+{
+  "summary": "这个 PR 让 Grok 订阅（SuperGrok）经网关用 Imagine API 生图和生视频，并给 magpie 自己的 Magpie Image MCP 服务器加了 generate_video 工具；界面上的改动只有文字：资源库里 Magpie Image 的说明（含中文翻译）加上了短视频，设置 → 图像 里生图关闭时的说明改成「不能生图或生成视频」。",
+  "scenes": [
+    {
+      "title": "资源库里 Magpie Image 的说明",
+      "shots": [
+        {
+          "file": "01-library-mcp-magpie-image.png",
+          "caption": "资源库 → MCP 服务器：Magpie Image 的说明文字",
+          "width": 2560
+        }
+      ]
+    },
+    {
+      "title": "生图关闭时的说明",
+      "shots": [
+        {
+          "file": "02-settings-images-imagegen.png",
+          "caption": "设置 → 图像：生图模型一行",
+          "width": 2560
+        },
+        {
+          "file": "03-settings-imagegen-picker.png",
+          "caption": "「生图模型」展开的选项列表",
+          "width": 2560
+        },
+        {
+          "file": "04-settings-imagegen-off.png",
+          "caption": "选择「不生成图片」后「生图模型」下面的说明",
+          "width": 2560
+        }
+      ]
+    }
+  ],
+  "video": "preview.mp4",
+  "poster": "poster.png",
+  "errors": [
+    "生图关闭时的说明 · click button: nothing visible matches button with \"不生成图片\" (0 in the page)"
+  ],
+  "leak": false,
+  "skipped": null,
+  "mismatch": "",
+  "unseen": "沙盒只有 DeepSeek 一个 API key、没有 Grok 订阅，也没有任何能生图的模型：Grok Imagine 的生图模型（grok-imagine-image / grok-imagine-image-quality，以及 AutoDrawer 对 Grok 计划的排序）、/v1/videos 的生视频和 generate_video 工具在这里都跑不出来，只能看到文字改动；Gateway 页的模型列表和最近调用也不会出现 Grok 的视频模型。",
+  "interactive": true,
+  "pages": 2
+}

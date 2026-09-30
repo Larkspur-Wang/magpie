@@ -1,0 +1,39 @@
+{
+  "summary": "供应商编辑器里，自定义供应商在「代理」下面多了一行「联网搜索」：勾选框「自己能联网搜索」加一段说明；打开编辑器时按已保存的值勾上，保存时把 searches 一并提交，复制供应商时也会带上。三种新文案补了中文。",
+  "scenes": [
+    {
+      "title": "供应商编辑器：新开关该出现的位置",
+      "shots": [
+        {
+          "file": "01-providers-list.png",
+          "caption": "供应商页的列表",
+          "width": 2560
+        },
+        {
+          "file": "02-provider-editor.png",
+          "caption": "打开后的供应商编辑器",
+          "width": 1296
+        },
+        {
+          "file": "03-editor-scrolled.png",
+          "caption": "编辑器往下滚一屏",
+          "width": 1296
+        },
+        {
+          "file": "04-editor-proxy-row.png",
+          "caption": "滚到「代理」一行附近：自定义供应商的「联网搜索」一行就在它下面",
+          "width": 1296
+        }
+      ]
+    }
+  ],
+  "video": "preview.mp4",
+  "poster": "poster.png",
+  "errors": [],
+  "leak": false,
+  "skipped": null,
+  "mismatch": "描述把这一行写在「面板」下，但菜单栏面板只有 Agent／额度／路由三个标签，没有供应商编辑器——这一行只在窗口的「供应商」页、自定义供应商的编辑器里。描述里的 CLI 用法（`provider add/set … search=yes|no`、`provider <id>` 显示 `search by itself`）是终端的，不在界面里。",
+  "unseen": "沙盒里只有 DeepSeek 一个预设供应商，没有自定义（中转）供应商——「联网搜索 · 自己能联网搜索」这一行只对自定义供应商显示，已登录账号也不显示，所以这一行本身录不到，只录它会出现的位置（编辑器里「代理」下面）。网关侧的行为（开着开关时 WebSearch 原样透传、关着时重建的请求仍带 Anthropic 的 metadata）只在真实 Claude Code 请求里体现，界面上没有对应显示。",
+  "interactive": true,
+  "pages": 1
+}

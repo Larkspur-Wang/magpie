@@ -11,16 +11,16 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  antigravity:
-    name: Antigravity adapter
+  plugins:
+    name: Provider plugins
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
-      - name: Native quota and plugin compatibility tests
-        run: node --test plugins/antigravity/*.test.mjs
+      - name: Plugin adapter tests
+        run: node --test plugins/*/*.test.mjs
 
   test:
     name: test (${{ matrix.os }})

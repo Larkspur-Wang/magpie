@@ -1,0 +1,98 @@
+# Fork-only: watches yetone/magpie for commits feat/mirasim hasn't taken in.
+# It keeps main a mirror of upstream (when GitHub's fork sync can), tries the
+# merge to see whether it conflicts, and keeps one "Upstream updates" issue
+# saying so, closed when there is nothing to take. It never pushes to
+# feat/mirasim: scripts/sync-upstream.sh merges, tests and pushes that.
+name: upstream watch
+
+on:
+  schedule:
+    - cron: '17 1 * * *' # 09:17 UTC+8
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: upstream-watch
+  cancel-in-progress: true
+
+jobs:
+  watch:
+    if: github.repository != 'yetone/magpie'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TITLE: Upstream updates
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/mirasim
+          fetch-depth: 0
+
+      - name: Compare with upstream
+        id: cmp
+        run: |
+          git remote add upstream https://github.com/yetone/magpie.git
+          git fetch --quiet --tags upstream main
+          new=$(git rev-list --count HEAD..upstream/main)
+          echo "new=$new" >> "$GITHUB_OUTPUT"
+          echo "describe=$(git describe --tags upstream/main)" >> "$GITHUB_OUTPUT"
+          git log --format='- `%h` %s' HEAD..upstream/main | head -60 > commits.md
+          git config user.name upstream-watch
+          git config user.email upstream-watch@users.noreply.github.com
+          if git merge --no-commit --no-ff upstream/main >/dev/null 2>&1; then
+            echo "conflicts=" >> "$GITHUB_OUTPUT"
+          else
+            echo "conflicts=$(git diff --name-only --diff-filter=U | tr '\n' ' ')" >> "$GITHUB_OUTPUT"
+          fi
+          git merge --abort 2>/dev/null || true
+
+      - name: Mirror upstream main
+        id: mirror
+        continue-on-error: true
+        run: gh api -X POST "repos/${{ github.repository }}/merge-upstream" -f branch=main
+
+      - name: Report
+        env:
+          NEW: ${{ steps.cmp.outputs.new }}
+          DESCRIBE: ${{ steps.cmp.outputs.describe }}
+          CONFLICTS: ${{ steps.cmp.outputs.conflicts }}
+          MIRROR: ${{ steps.mirror.outcome }}
+        run: |
+          issue=$(gh issue list --state open --search "in:title \"$TITLE\"" --json number --jq '.[0].number // empty')
+          if [ "$NEW" = 0 ]; then
+            [ -n "$issue" ] && gh issue close "$issue" --comment "feat/mirasim has every upstream commit ($DESCRIBE)."
+            exit 0
+          fi
+          {
+            echo "upstream/main is **$DESCRIBE**: **$NEW** commit(s) not yet in \`feat/mirasim\`."
+            echo
+            if [ -n "$CONFLICTS" ]; then
+              echo "Merging **conflicts** in: \`$CONFLICTS\` — resolve them by hand."
+            else
+              echo "The merge applies cleanly."
+            fi
+            if [ "$MIRROR" != success ]; then
+              echo
+              echo "GitHub's fork sync could not update \`main\` (upstream may have changed workflow files): \`scripts/sync-upstream.sh\` mirrors it from a local checkout."
+            fi
+            echo
+            echo 'Take it in locally (merges, tests, pushes; `--install` also builds, installs and tags the app):'
+            echo
+            echo '```sh'
+            echo 'scripts/sync-upstream.sh --install'
+            echo '```'
+            echo
+            echo '<details><summary>Commits</summary>'
+            echo
+            cat commits.md
+            echo
+            echo '</details>'
+          } > body.md
+          if [ -n "$issue" ]; then
+            gh issue edit "$issue" --body-file body.md
+          else
+            gh issue create --title "$TITLE" --body-file body.md
+          fi

@@ -5,7 +5,8 @@ a Mirasim gateway provider, with model discovery, MCP tool bridging and
 gateway token usage and native platform quota windows.
 See [setup, limits and local build](docs/mirasim.md).
 See [runtime verification and boundaries](docs/mirasim-verification.md).
-Development branch: `feat/mirasim`.
+It also ships provider plugins in [`plugins/`](plugins) (Cohub, Antigravity).
+Branches, versions and taking in upstream: [FORK.md](FORK.md).
 
 One place to pick every agent's model: Codex on DeepSeek, Claude Code
 on Kimi, Gemini CLI on GLM, from the menu bar. [usemagpie.ai](https://usemagpie.ai)

@@ -89,19 +89,11 @@ This does not remove Mirasim or its own sign-in.
 
 ## Upstream Maintenance
 
-The optional [Antigravity adapter](../plugins/antigravity/README.md) supplies
-the community plugin's current native models and actual Google quota pools.
-It can coexist with Mirasim, Codex, Cursor, Grok and WorkBuddy sources without
-replacing their authentication. WorkBuddy AI accounts with an explicit empty
-native credit-package list display `0 credits`, not an invented percentage.
-
-```sh
-git fetch upstream
-git switch feat/mirasim
-git merge upstream/main
-go test -tags nogui ./...
-git push origin feat/mirasim
-```
+See [FORK.md](../FORK.md): branch model, version tags, the upstream-watch
+workflow and `scripts/sync-upstream.sh`. Other sources live in
+[`plugins/`](../plugins) and leave upstream code alone: the
+[Antigravity adapter](../plugins/antigravity/README.md) and the
+[Cohub plugin](../plugins/cohub/README.md).
 
 The official release-dispatch workflow is restricted to the upstream
 repository. This fork cannot dispatch releases into yetone's release repo.

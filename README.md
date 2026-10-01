@@ -4,6 +4,7 @@
 a Mirasim gateway provider, with model discovery, MCP tool bridging and
 gateway token usage and native platform quota windows.
 See [setup, limits and local build](docs/mirasim.md).
+See [runtime verification and boundaries](docs/mirasim-verification.md).
 Development branch: `feat/mirasim`.
 
 One place to pick every agent's model: Codex on DeepSeek, Claude Code

@@ -2,7 +2,7 @@ const base = process.env.MAGPIE_VERIFY_URL || "http://127.0.0.1:3425"
 const cases = process.argv.slice(2)
 const models = cases.length ? cases : [
   "mirasim/glm-5.3-flash", "codex/gpt-6.1-sol", "cursor/cursor-grok-4.6",
-  "grok/grok-4.7", "workbuddy/deepseek-v4.1-flash", "workbuddy-ai/gemini-3.8-flash",
+  "grok/grok-4.7", "workbuddy/deepseek-v4.1-flash", "cohub/glm-5.3-flash:text",
   "google-plugin/gemini-3.7-flash",
 ]
 const results = []

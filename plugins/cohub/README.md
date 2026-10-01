@@ -40,8 +40,11 @@ Optional `plugins.json` options on the entry:
 ## Usage and quota
 
 Magpie records each request's tokens, served model and latency like any
-provider's. Cohub's CLI client has no balance endpoint, so the plugin reports
-the signed-in account and no allowance windows rather than an invented one.
+provider's. The plugin also reads Cohub's billing API: the card's line is what
+the account can spend (Cohub's own net total), and every credit pack is a
+window — used percent, left of what it granted, and when it expires. Packs
+that can't be spent show as aside, one that overspent its own grant is named
+as overage without an invented percentage.
 
 ## Tests
 

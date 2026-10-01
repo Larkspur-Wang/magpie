@@ -160,3 +160,45 @@ export async function* streamChunks(events, model, created = Math.floor(Date.now
   yield chunk(open({}), "stop")
   yield "data: [DONE]\n\n"
 }
+
+// balance is Cohub's credit reply as the line a card shows and the windows
+// behind it. Each grant is a pack that expires on its own, so each is a
+// window; the line is what the account can spend now (Cohub's own netUsd,
+// which begins at 0), a bare number because that line is also read back for
+// the low-balance alert.
+export function balance(credits, plan = "Cohub") {
+  const usd = (n) => `$${(Math.round((n ?? 0) * 100) / 100).toFixed(2)}`
+  const windows = []
+  let available = 0
+  for (const g of credits?.groups ?? []) {
+    for (const x of g.grants ?? []) {
+      const name = x.benefitName || x.benefitKey || x.grantKind || "Credits"
+      if (x.unavailableReasons?.includes("overage") || (x.settledOverageAmountUsd ?? 0) > 0) {
+        windows.push({
+          name,
+          used: 0,
+          used_unknown: true, // the reply doesn't say how much of it was spent
+          display: `${usd(x.remainingAmountUsd)} left (overage)`,
+          aside: true,
+        })
+        if (x.availableNow) available += x.remainingAmountUsd ?? 0
+        continue
+      }
+      if (x.availableNow) available += x.remainingAmountUsd ?? 0
+      if (typeof x.originalAmountUsd !== "number" || typeof x.consumedPercent !== "number") {
+        // a pack whose size or reading is unknown: named, not given a percent
+        windows.push({ name, display: x.availableNow ? `${usd(x.remainingAmountUsd)} left` : (x.status ?? "unavailable"), aside: !x.availableNow })
+        continue
+      }
+      windows.push({
+        name,
+        used: Math.max(0, x.consumedPercent),
+        display: `${usd(x.remainingAmountUsd)} of ${usd(x.originalAmountUsd)} left`,
+        ...(x.expiresAt ? { resetsAt: x.expiresAt } : {}),
+        ...(x.availableNow ? {} : { aside: true }),
+      })
+    }
+  }
+  const spendable = typeof credits?.netUsd === "number" ? credits.netUsd : available
+  return { plan, balance: usd(spendable), windows }
+}

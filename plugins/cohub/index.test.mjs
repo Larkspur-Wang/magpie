@@ -4,7 +4,7 @@ import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import cohub, { findCLI, modelsFrom } from "./index.mjs"
-import { toCohubInput, toChatCompletion, streamChunks, usage } from "./convert.mjs"
+import { balance, toCohubInput, toChatCompletion, streamChunks, usage } from "./convert.mjs"
 
 const MODELS = {
   cohub: [
@@ -29,6 +29,7 @@ async function fakeCLI(t, { events, result, error, me = { email: "lark@example.c
       return {
         models: { list: async () => script.models },
         user: { getMe: async () => { if (script.error) fail(); return script.me } },
+        transport: { request: async (path) => ({ path, script }) },
         space(id) {
           return {
             async completion(input) { calls.push({ id, input, stream: false }); if (script.error) fail(); return script.result },
@@ -193,10 +194,51 @@ test("sign-in and usage read the CLI's account; a lapsed CLI login says so", asy
   const flow = await hooks.auth.methods[0].authorize()
   assert.equal(flow.method, "auto")
   assert.deepEqual(await flow.callback(), { type: "success", key: "cohub-cli", metadata: { email: "lark@example.com" } })
-  assert.deepEqual(await hooks.auth.usage(), { plan: "Cohub", user: "lark@example.com", windows: [] })
+  assert.equal((await hooks.auth.usage()).user, "lark@example.com")
 
   const out = await fakeCLI(t, { error: { status: 401, message: "Not authenticated", name: "AuthRequiredError" } })
   const lapsed = await cohub({}, { root: out })
   assert.equal((await lapsed.auth.usage()).signIn, "expired")
   assert.equal((await lapsed.auth.methods[0].authorize().then((f) => f.callback())).type, "failed")
+})
+
+test("credits become a spendable line and one window per pack", () => {
+  const out = balance({
+    netUsd: 109.2120133,
+    groups: [
+      { key: "lt_30d", grants: [{ benefitName: "Legend Monthly Credits", grantKind: "plan_period", status: "depleted", availableNow: false, unavailableReasons: ["depleted"], originalAmountUsd: 250, remainingAmountUsd: 0, consumedPercent: 100, expiresAt: "2026-10-15T09:12:44.859Z" }] },
+      { key: "gte_30d", grants: [
+        { benefitName: "Max Balance Pack Benefit", grantKind: "purchased", status: "active", availableNow: true, unavailableReasons: [], originalAmountUsd: 225, remainingAmountUsd: 109.2120133, consumedPercent: 51.5, expiresAt: "2028-07-14T09:12:53.610Z" },
+        { benefitName: "Spent pack", grantKind: "purchased", status: "depleted", availableNow: false, unavailableReasons: ["depleted"], originalAmountUsd: 10, remainingAmountUsd: 0, consumedPercent: 100 },
+      ] },
+    ],
+  }, "Legend")
+  assert.equal(out.plan, "Legend")
+  assert.equal(out.balance, "$109.21")
+  assert.deepEqual(out.windows.map((w) => [w.name, w.used, w.aside]), [
+    ["Legend Monthly Credits", 100, true],
+    ["Max Balance Pack Benefit", 51.5, undefined],
+    ["Spent pack", 100, true],
+  ])
+  assert.equal(out.windows[1].display, "$109.21 of $225.00 left")
+  assert.equal(out.windows[1].resetsAt, "2028-07-14T09:12:53.610Z")
+
+  // a pack whose size the reply doesn't give keeps its name, no percent
+  const odd = balance({ groups: [{ key: "gt_30d", grants: [{ benefitName: "Overage", availableNow: true, remainingAmountUsd: 1.5, settledOverageAmountUsd: 2, unavailableReasons: ["overage"] }] }] })
+  assert.equal(odd.windows[0].used_unknown, true)
+  assert.equal(odd.windows[0].display, "$1.50 left (overage)")
+  assert.equal(odd.windows[0].aside, true)
+  // with no netUsd, what can be spent is summed; nothing at all reads $0.00
+  assert.equal(balance({ groups: [{ key: "gt_30d", grants: [{ benefitName: "x", availableNow: true, remainingAmountUsd: 3 }] }] }).balance, "$3.00")
+  assert.equal(balance({}).balance, "$0.00")
+})
+
+test("its usage reports the credits, the account and the subscription", async (t) => {
+  const root = await fakeCLI(t)
+  const hooks = await cohub({}, { root })
+  const u = await hooks.auth.usage()
+  assert.equal(u.plan, "Cohub") // the fake transport holds no subscriptions
+  assert.equal(u.user, "lark@example.com")
+  assert.equal(u.balance, "$0.00")
+  assert.deepEqual(u.windows, [])
 })

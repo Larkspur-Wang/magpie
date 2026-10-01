@@ -12,7 +12,7 @@ import { existsSync, readdirSync, readFileSync } from "node:fs"
 import { homedir } from "node:os"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
-import { MODEL_SUFFIX, RequestError, toChatCompletion, toCohubInput, streamChunks } from "./convert.mjs"
+import { MODEL_SUFFIX, RequestError, balance, toChatCompletion, toCohubInput, streamChunks } from "./convert.mjs"
 
 export const PROVIDER = "cohub"
 const PACKAGE = path.join("@neta-art", "cohub-cli")
@@ -115,6 +115,22 @@ export function modelsFrom(list) {
     }
   }
   return out
+}
+
+// The CLI's client carries the billing API on some of its builds; where it
+// doesn't, the transport underneath answers the same paths.
+function billing(client) {
+  return client.billing ?? {
+    getCredits: () => client.transport.request("/api/billing/credits"),
+    getSubscriptions: () => client.transport.request("/api/billing/subscriptions"),
+  }
+}
+
+// subscriptionPlan is the name of the active subscription, for the card's
+// plan line; "" when its reply holds none.
+async function subscriptionPlan(client) {
+  const items = (await billing(client).getSubscriptions())?.subscriptions?.items ?? []
+  return items.find((s) => s.status === "active")?.productName ?? ""
 }
 
 export default async function cohub(input, options = {}) {
@@ -231,16 +247,26 @@ export default async function cohub(input, options = {}) {
       async loader() {
         return { apiKey: "cohub-cli", fetch: complete }
       },
-      // Cohub's CLI client has no balance endpoint: the account and that it
-      // answers, no invented allowance.
+      // Cohub's credits, as the billing API reports them: the spendable
+      // total on the line, each credit pack a window.
       async usage() {
         try {
           const { client } = await load()
-          const me = await client.user.getMe()
-          return { plan: "Cohub", user: me.email ?? me.profile?.username ?? "", windows: [] }
+          const b = billing(client)
+          const [me, credits, plan] = await Promise.all([
+            client.user.getMe(),
+            b.getCredits(),
+            subscriptionPlan(client).catch(() => ""),
+          ])
+          return { ...balance(credits, plan || "Cohub"), user: me.email ?? me.profile?.username ?? "" }
         } catch (e) {
-          if (e?.name === "AuthRequiredError" || e?.status === 401) return { windows: [], error: "Cohub CLI is not signed in: run cohub auth login", signIn: "expired" }
-          return { windows: [], error: String(e?.message ?? e) }
+          const gone = e?.name === "AuthRequiredError" || e?.status === 401
+          return {
+            windows: [],
+            plan: "Cohub",
+            error: gone ? "Cohub CLI is not signed in: run cohub auth login" : String(e?.message ?? e),
+            ...(gone ? { signIn: "expired" } : {}),
+          }
         }
       },
     },

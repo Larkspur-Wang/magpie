@@ -50,6 +50,10 @@ for (const width of [900, 480]) {
       const box = await row.boundingBox();
       assert(box && box.x >= 0 && box.x + box.width <= width + 1, JSON.stringify(box));
       await page.locator("#mirasimSegs").evaluate((el) => el.scrollIntoView({ block: "center" }));
+      await page.waitForFunction(() => {
+        const r = document.querySelector("#mirasimSegs").getBoundingClientRect();
+        return r.top >= 60 && r.bottom <= innerHeight;
+      });
       assert.deepEqual(errors, []);
       if (process.env.ARTIFACT_DIR) {
         await fs.mkdir(process.env.ARTIFACT_DIR, { recursive: true });

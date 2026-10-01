@@ -44,6 +44,9 @@ func (p Provider) Test(ctx context.Context) []Result {
 		return p.testDecide(ctx)
 	}
 	p.Fetch(ctx)
+	if p.isClaudeAccount() {
+		return []Result{p.testClaude(ctx, p.testModel(p, Anthropic))}
+	}
 	var out []Result
 	for _, proto := range p.Speaks() {
 		q, ok := p.keyFor(proto)
@@ -131,8 +134,13 @@ func (p Provider) TestModels(ctx context.Context, models []string) []Result {
 }
 
 func (p Provider) testOne(ctx context.Context, model string) Result {
+	// a Mirasim account is probed through `mirasim claude`, a Claude one
+	// through Claude Code: both are run by their own CLI (fork)
 	if p.Account != nil && p.Account.Agent == "mirasim" {
 		return mirasimTest(ctx, model)
+	}
+	if p.isClaudeAccount() {
+		return p.testClaude(ctx, model)
 	}
 	var protos []Protocol
 	for _, pr := range p.Speaks() {

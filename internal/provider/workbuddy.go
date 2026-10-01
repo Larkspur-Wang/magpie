@@ -613,6 +613,9 @@ func wbQuota(ctx context.Context, a wbAccount) SubscriptionQuota {
 	if total > 0 {
 		w := QuotaWindow{Name: "Credits", Used: 100 * used / total, Display: fmt.Sprintf("%s / %s", compactNumber(used), compactNumber(total))}
 		q.Windows = append(q.Windows, w)
+	} else if a.site.id == WorkBuddyAIID && sum.Packages != nil && len(sum.Packages) == 0 {
+		// An explicit empty package list reports no credits, not an unknown balance.
+		q.Balance = "0 credits"
 	}
 	return q
 }

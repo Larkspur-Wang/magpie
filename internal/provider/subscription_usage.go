@@ -134,6 +134,11 @@ func visibleQuotas(all []SubscriptionQuota) []SubscriptionQuota {
 		if hidden[q.Provider] {
 			continue
 		}
+		if q.Provider == "mirasim" {
+			if _, ok := mirasimAccount(); !ok {
+				continue
+			}
+		}
 		if q.Provider == "gemini" || q.Provider == "antigravity" {
 			if chosen == nil {
 				chosen = exposedIDs()
@@ -209,6 +214,9 @@ func fetchSubscriptionUsage() []SubscriptionQuota {
 		hidden[p.ID] = p.Hidden || p.Off // switched off: not asked either
 	}
 	var fetches []func() SubscriptionQuota
+	if p, ok := mirasimAccount(); ok && !hidden["mirasim"] {
+		fetches = append(fetches, withUser(p.Account.User, func() SubscriptionQuota { return mirasimSubscriptionUsage(via("mirasim")) }))
+	}
 	// a built-in moved onto its plugin shows the plugin's cards in its
 	// place, and none of its own: an agent's own sign-in it still finds
 	// would be a second card of the same account

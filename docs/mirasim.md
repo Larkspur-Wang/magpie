@@ -10,6 +10,7 @@ unchanged to keep upstream merges small.
 magpie-mirasim mirasim on
 magpie-mirasim launch claude
 magpie-mirasim mirasim sync
+magpie-mirasim quota mirasim --json
 ```
 
 Settings also has **Claude launcher** (Native / mirasim claude) and
@@ -35,9 +36,19 @@ Other agents can select `mirasim/<model>` or a routing group containing it.
 The gateway records tokens, cache usage, actual served model, latency and
 status, through the same ledger and routing machinery as other sources.
 
-This does **not** aggregate Mirasim's balance with other subscriptions, or
-import traffic that bypasses Magpie. The cost displayed by Magpie is its
-model-price estimate, not a verified Mirasim invoice. Mirasim controls its
+The Usage page reads Mirasim's platform plan, 5-hour and weekly percentages,
+model-scoped Claude/Fable windows and plan expiry through the native
+`mirasim ui-cli --port 4970 relay status` command. These windows also feed
+Magpie's allowance-aware routing. Keep Mirasim's desktop host running for
+quota reads; `MAGPIE_MIRASIM_PORT` selects another local host port. Magpie
+does not read the host's access token itself. Native failures remain errors
+or timestamped last readings, never fabricated zero usage. A local/own
+Mirasim route is not presented as a usable platform allowance.
+
+Percentages from different providers are not added into a fictitious shared
+balance. Historical traffic that bypasses Magpie is not imported. The cost
+displayed by Magpie is its model-price estimate, not a verified Mirasim
+invoice. Mirasim controls its
 own platform/native routing; `mirasim` as the selected provider alone is
 not proof of which upstream paid for a request. Inspect Mirasim traffic
 when that distinction matters. Magpie sees this CLI as one source, not
@@ -50,8 +61,9 @@ Magpie group, select **Native** first. Mirasim can remain a provider for the
 group while the outer Claude Code runs normally.
 
 The first version supports text, streaming and caller-supplied function
-tools via MCP. Image capabilities and remaining-credit APIs are not
-advertised without verified native metadata. A missing Mirasim runtime is
+tools via MCP, plus the active native platform account's quota windows.
+Image capabilities and monetary credit balances are not advertised without
+verified native metadata. A missing Mirasim runtime is
 an error, never a silent fallback to plain Claude Code.
 
 ## Local macOS Build

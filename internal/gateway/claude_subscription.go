@@ -249,6 +249,14 @@ func (b *subscriptionBridge) start(ctx context.Context, req *Request, model, oau
 	if err != nil {
 		return nil, nil, err
 	}
+	env := netproxy.EnvWith(claudeProxy(ctx), cleanClaudeEnv(os.Environ()))
+	if oauth != "" {
+		env = append(env, "CLAUDE_CODE_OAUTH_TOKEN="+oauth)
+	}
+	return b.startCommand(req, model, owner, binary, nil, env)
+}
+
+func (b *subscriptionBridge) startCommand(req *Request, model, owner, binary string, prefix, env []string) (*subscriptionRun, <-chan Event, error) {
 	exe, err := os.Executable()
 	if err != nil {
 		return nil, nil, err
@@ -274,13 +282,9 @@ func (b *subscriptionBridge) start(ctx context.Context, req *Request, model, oau
 		"magpie": map[string]any{"command": exe, "args": []string{"claude-mcp-helper", callback, toolsPath}},
 	}})
 	args := claudeCLIArgs(model, string(mcpConfig), req.Effort, req.WebSearch)
-	cmd := proc.CommandContext(context.Background(), binary, args...)
+	cmd := proc.CommandContext(context.Background(), binary, append(slices.Clone(prefix), args...)...)
 	cmd.Dir = tmp
-	cmd.Env = netproxy.EnvWith(claudeProxy(ctx), cleanClaudeEnv(os.Environ()))
-	if oauth != "" {
-		// a saved account in use beside the one Claude Code is signed in to
-		cmd.Env = append(cmd.Env, "CLAUDE_CODE_OAUTH_TOKEN="+oauth)
-	}
+	cmd.Env = env
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		cleanup()
@@ -705,7 +709,7 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 		if json.Unmarshal(s.Bytes(), &envelope) != nil {
 			continue
 		}
-		if envelope.Type == "rate_limit_event" {
+		if envelope.Type == "rate_limit_event" && !strings.HasPrefix(r.owner, "mirasim\x00") {
 			if _, user, ok := strings.Cut(r.owner, "\x00"); ok {
 				provider.NoteClaudeLimits(user, claudeLimits(envelope.RateLimitInfo))
 			}

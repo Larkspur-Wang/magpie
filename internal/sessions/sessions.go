@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/mirasim"
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/settings"
 )
@@ -1013,6 +1014,16 @@ func ResumeCommand(agent, id, cwd string) string {
 	switch agent {
 	case "claude":
 		run = "claude --resume " + id
+		if settings.Load().ClaudeLauncher == "mirasim" {
+			if runtime.GOOS == "windows" {
+				return "" // POSIX command rendering is not a PowerShell command
+			}
+			c, err := mirasim.Resolve()
+			if err != nil {
+				return "" // never silently fall back to a different upstream
+			}
+			run = c.Shell("claude", "--resume", id)
+		}
 	case "codex":
 		run = "codex resume " + id
 	case "opencode":

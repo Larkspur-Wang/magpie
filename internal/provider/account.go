@@ -794,6 +794,9 @@ func Accounts() []Provider {
 		cfg = filepath.Join(home, ".config")
 	}
 	var out []Provider
+	if p, ok := mirasimAccount(); ok {
+		out = append(out, p)
+	}
 	if p, ok := claudeAccount(); ok {
 		out = append(out, p)
 	}

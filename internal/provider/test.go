@@ -33,6 +33,13 @@ type Result struct {
 // sees, and reports what came back.
 func (p Provider) Test(ctx context.Context) []Result {
 	ctx = p.Via(ctx)
+	if p.Account != nil && p.Account.Agent == "mirasim" {
+		ms := p.Exposed()
+		if len(ms) == 0 {
+			return []Result{{Protocol: Anthropic, Error: "refresh the Mirasim model catalog first"}}
+		}
+		return []Result{mirasimTest(ctx, ms[0].ID)}
+	}
 	if p.Decides() {
 		return p.testDecide(ctx)
 	}
@@ -124,6 +131,9 @@ func (p Provider) TestModels(ctx context.Context, models []string) []Result {
 }
 
 func (p Provider) testOne(ctx context.Context, model string) Result {
+	if p.Account != nil && p.Account.Agent == "mirasim" {
+		return mirasimTest(ctx, model)
+	}
 	var protos []Protocol
 	for _, pr := range p.Speaks() {
 		if pr == Chat || pr == Responses || pr == Anthropic {

@@ -1,5 +1,10 @@
 # magpie
 
+**Mirasim edition:** this fork adds a native `mirasim claude` launcher and
+a Mirasim gateway provider, with model discovery, MCP tool bridging and
+gateway token usage. See [setup, limits and local build](docs/mirasim.md).
+Development branch: `feat/mirasim`.
+
 One place to pick every agent's model: Codex on DeepSeek, Claude Code
 on Kimi, Gemini CLI on GLM, from the menu bar. [usemagpie.ai](https://usemagpie.ai)
 

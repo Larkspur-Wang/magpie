@@ -15,6 +15,8 @@ import (
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/gateway"
+	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/settings"
 )
 
 // Claude Code reads its endpoint from the `env` block of settings.json.
@@ -174,6 +176,9 @@ func claudeIn(at place) *Agent {
 	stale := ""
 	var writeTiers func(main string, tiers map[string]string) error
 	set := func(v string) error {
+		if settings.Load().ClaudeLauncher == "mirasim" && isMagpie(v) {
+			return fmt.Errorf("Mirasim owns Claude Code's upstream; select the native Claude launcher before routing Claude Code through Magpie")
+		}
 		if v == "" {
 			// Claude Code as installed: Anthropic's own endpoint and model
 			keys := []string{"model"}
@@ -292,6 +297,22 @@ func claudeIn(at place) *Agent {
 		Set: set,
 		Options: func(map[string]string) []Option {
 			name := "Claude Code"
+			if settings.Load().ClaudeLauncher == "mirasim" {
+				var own []Option
+				for _, p := range provider.All() {
+					if p.Account == nil || p.Account.Agent != "mirasim" {
+						continue
+					}
+					for _, m := range p.Exposed() {
+						id := m.ID
+						if strings.HasPrefix(id, "claude-") && m.Context >= 1000000 {
+							id += "[1m]"
+						}
+						own = append(own, Option{Value: id, Label: m.Name})
+					}
+				}
+				return group("Mirasim Claude CLI", append(claudeOwn(), own...))
+			}
 			if u := env("ANTHROPIC_BASE_URL"); u != "" && !routed() {
 				name += " · " + hostOf(u)
 			}
@@ -446,12 +467,19 @@ func claudeIn(at place) *Agent {
 		})
 	}
 
+	name := "Claude Code"
+	if settings.Load().ClaudeLauncher == "mirasim" {
+		name += " (Mirasim)"
+	}
 	return &Agent{
-		ID: "claude", Name: "Claude Code", Icon: "claudecode-color", Aliases: []string{"cc", "claude-code"},
+		ID: "claude", Name: name, Icon: "claudecode-color", Aliases: []string{"cc", "claude-code"},
 		UA:  []string{"claude-cli", "claude-code"},
 		Bin: "claude", Dir: filepath.Dir(path), Path: path,
 		Fields: fields,
 		Check: func() string {
+			if settings.Load().ClaudeLauncher == "mirasim" && routed() {
+				return "Claude Code is configured for Magpie but its launcher is Mirasim; restore a native model or select the native launcher"
+			}
 			if !isMagpie(get()) {
 				return ""
 			}

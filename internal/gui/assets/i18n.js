@@ -11,6 +11,8 @@ const I18N = {
     "Usage": "用量",
     "Library": "资源库",
     "Settings": "设置",
+    "Claude launcher": "Claude 启动方式",
+    "Mirasim provider": "Mirasim 模型来源",
     "Refresh model lists (models.dev and every vendor) and check for a newer magpie": "刷新模型列表（models.dev 与各供应商），并检查 magpie 更新",
     "Open as a window": "在窗口中打开",
     "Open magpie": "打开 magpie",

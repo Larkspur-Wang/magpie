@@ -32,6 +32,10 @@ type Settings struct {
 	// SessionTerminal is the Mac app that opens a resumed session, by bundle
 	// id. "" and "system" follow the .command file association.
 	SessionTerminal string `json:"sessionTerminal,omitempty"`
+	// Mirasim exposes the installed native CLI as a gateway provider.
+	Mirasim bool `json:"mirasim,omitempty"`
+	// ClaudeLauncher selects the native CLI or the Mirasim wrapper for launch/resume.
+	ClaudeLauncher string `json:"claudeLauncher,omitempty"`
 	// Currency is what a cost — the Usage page's, the tray panel's, the
 	// TUI's and the CLI's — is shown converted to: usd (its native
 	// currency, list prices being in dollars) or cny, at a live exchange
@@ -467,6 +471,9 @@ func Save(s Settings) error {
 	}
 	if s.SessionTerminal != "" && s.SessionTerminal != "system" && !validTerminalBundleID.MatchString(s.SessionTerminal) {
 		return fmt.Errorf("session terminal must be an app bundle id or system, not %q", s.SessionTerminal)
+	}
+	if !slices.Contains([]string{"", "native", "mirasim"}, s.ClaudeLauncher) {
+		return fmt.Errorf("Claude launcher must be native or mirasim")
 	}
 	if !slices.Contains(Currencies, s.Currency) {
 		return fmt.Errorf("currency must be one of %v, not %q", Currencies, s.Currency)

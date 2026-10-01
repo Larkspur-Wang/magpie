@@ -37,6 +37,9 @@ const usage = `magpie — one place to pick every agent's model
                                   the app's window in a browser, with the gateway (no desktop needed: WSL, a server over SSH)
                                   a new key each run; MAGPIE_WEB_KEY (16+ letters, digits, - . _ ~) keeps one, signed in for 400 days
   magpie ls                       list detected agents and their settings
+
+  magpie mirasim [on|off|sync]     native Mirasim provider and Claude launch mode
+  magpie launch claude [args...]  start Claude Code with the selected launcher
   magpie <agent>                  show one agent
   magpie <agent> <model>          set an agent's model   e.g. magpie claude deepseek/deepseek-chat
   magpie <agent> <field> <value>  set another field   e.g. magpie codex effort high
@@ -175,6 +178,10 @@ func run(args []string) error {
 		return list(append(shown, hidden...), true, len(shown))
 	case "agents":
 		return list(agent.All(), false, -1)
+	case "mirasim":
+		return mirasimCmd(args[1:])
+	case "launch":
+		return launchCmd(args[1:])
 	case "sync":
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()

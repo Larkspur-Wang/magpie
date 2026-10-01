@@ -22,6 +22,7 @@ import (
 	"github.com/yetone/magpie/internal/fx"
 	"github.com/yetone/magpie/internal/gateway"
 	"github.com/yetone/magpie/internal/library"
+	"github.com/yetone/magpie/internal/mirasim"
 	"github.com/yetone/magpie/internal/netproxy"
 	"github.com/yetone/magpie/internal/profile"
 	"github.com/yetone/magpie/internal/provider"
@@ -486,6 +487,21 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 		in.CodexAutoReset, in.ClaudeAutoReset = cur.CodexAutoReset, cur.ClaudeAutoReset
 		// and the text size, which the keyboard changes too (text-size below)
 		in.TextSize = cur.TextSize
+		if in.ClaudeLauncher == "mirasim" && cur.ClaudeLauncher != "mirasim" {
+			if _, err := mirasim.Resolve(); err != nil {
+				fail(rw, err)
+				return
+			}
+		}
+		if in.Mirasim && !cur.Mirasim {
+			ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+			_, err := provider.RefreshMirasim(ctx)
+			cancel()
+			if err != nil {
+				fail(rw, err)
+				return
+			}
+		}
 		if v := strings.TrimSpace(in.Vision); v != "" && v != "off" && v != cur.Vision {
 			if _, _, ok := provider.Resolve(v); !ok {
 				fail(rw, fmt.Errorf("no model %s to describe images", v))

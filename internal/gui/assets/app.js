@@ -8673,6 +8673,10 @@ function renderSettings() {
   $("#dockSegs").replaceChildren(segs([["off", t("Hide")], ["window", t("With window")], ["on", t("Show")]],
     s.dock ? "on" : s.dockWindow ? "window" : "off", (v) => savePrefs({ ...keep, dock: v === "on", dockWindow: v === "window" })));
   renderSessionTerminal(s, keep);
+  $("#claudeLauncherSegs").replaceChildren(segs([["native", t("Native")], ["mirasim", "mirasim claude"]],
+    s.claudeLauncher || "native", (v) => savePrefs({ ...keep, claudeLauncher: v === "native" ? "" : v })));
+  $("#mirasimSegs").replaceChildren(segs([["off", t("Off")], ["on", t("On")]],
+    s.mirasim ? "on" : "off", (v) => savePrefs({ ...keep, mirasim: v === "on" })));
   renderBarIcon();
   // the system's record, set on its own, not with the other choices
   $("#loginSegs").replaceChildren(segs([["off", t("Off")], ["on", t("On")]], s.login ? "on" : "off", (v) =>
@@ -9526,6 +9530,7 @@ function wbCheckinLine(r) {
 function prefsKeep(s) {
   return { theme: s.theme, lang: s.lang, tray: s.tray, dock: !!s.dock, dockWindow: !!s.dockWindow, proxy: s.proxy || "",
     sessionTerminal: s.sessionTerminal || "",
+    claudeLauncher: s.claudeLauncher || "", mirasim: !!s.mirasim,
     trayUsages: s.trayUsages || [],
     redact: !!s.redact, redactPersonal: !!s.redactPersonal, redactWords: s.redactWords || [], codexWarmup: s.codexWarmup || "",
     claudeWarmup: s.claudeWarmup || "", codexWarmAt: s.codexWarmAt || "", claudeWarmAt: s.claudeWarmAt || "", workbuddyCheckin: !!s.workbuddyCheckin, noStats: !!s.noStats,

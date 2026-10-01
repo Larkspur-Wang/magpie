@@ -1267,6 +1267,10 @@ func (s *Server) attempt(w http.ResponseWriter, r *http.Request, from provider.P
 	// every request to the provider goes through its own proxy, if it has
 	// one (#237)
 	r = r.WithContext(p.Via(r.Context()))
+	if p.Account != nil && p.Account.Agent == "mirasim" {
+		call.To = provider.Anthropic
+		return s.serveMirasim(w, r, from, p, model, body, &call.Usage)
+	}
 	// A Claude Code subscription must run through the genuine binary. Direct
 	// OAuth HTTP requests are content-classified as third-party traffic when
 	// they carry another agent's harness (Pi, OpenCode, and others).

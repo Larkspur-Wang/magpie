@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -35,5 +36,26 @@ func TestMirasimLauncherDoesNotWriteConflictingGatewaySettings(t *testing.T) {
 	}
 	if err := a.Field("model").Set("opus"); err != nil {
 		t.Fatal(err)
+	}
+	path := filepath.Join(h, "mirasim")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\necho '{\"agent\":\"claude\",\"models\":[{\"id\":\"glm-5.3-flash\"},{\"id\":\"claude-opus-5-5[1m]\",\"contextWindow\":1000000}]}'\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MAGPIE_MIRASIM_BIN", path)
+	if _, err := provider.RefreshMirasim(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	s.Mirasim = true
+	if err := settings.Save(s); err != nil {
+		t.Fatal(err)
+	}
+	opts := claude(h).Field("model").Options(nil)
+	if len(opts) != 2 {
+		t.Fatalf("advertised non-Mirasim models: %+v", opts)
+	}
+	for _, o := range opts {
+		if o.Value != "glm-5.3-flash" && o.Value != "claude-opus-5-5[1m]" {
+			t.Fatalf("wrong native model ID: %+v", o)
+		}
 	}
 }

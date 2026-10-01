@@ -34,6 +34,11 @@ echo '{"agent":"claude","models":[{"id":"claude-opus-5-5[1m]","label":"Opus","co
 	if len(ms) != 2 || ms[0].ID != "claude-opus-5-5" || ms[0].Context != 1000000 || !reflect.DeepEqual(ms[0].Efforts, []string{"low"}) {
 		t.Fatalf("%+v", ms)
 	}
+	for model, want := range map[string]string{"claude-opus-5-5": "claude-opus-5-5[1m]", "claude-opus-5-5[1m]": "claude-opus-5-5[1m]", "glm-5.3-flash": "glm-5.3-flash"} {
+		if got := MirasimModelID(model); got != want {
+			t.Fatalf("%s: %s, want %s", model, got, want)
+		}
+	}
 	s := settings.Load()
 	s.Mirasim = true
 	if err := settings.Save(s); err != nil {

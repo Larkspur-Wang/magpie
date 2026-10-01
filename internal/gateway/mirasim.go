@@ -23,7 +23,7 @@ func (s *Server) serveMirasim(w http.ResponseWriter, r *http.Request, from provi
 		}
 		env := netproxy.EnvWith(netproxy.Choice(ctx), cleanClaudeEnv(os.Environ()))
 		env = append(env, "MIRASIM_QUIET=1")
-		return s.subscription.startCommand(req, model, owner, c.Binary, c.With("claude"), env)
+		return s.subscription.startCommand(req, provider.MirasimModelID(model), owner, c.Binary, c.With("claude"), env)
 	}
 	return s.serveSubscription(w, r, from, "Mirasim Claude", model, body, usage, start)
 }

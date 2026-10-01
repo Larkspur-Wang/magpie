@@ -50,7 +50,7 @@ func RefreshMirasim(ctx context.Context) ([]catalog.Model, error) {
 
 func mirasimTest(ctx context.Context, model string) Result {
 	start := time.Now()
-	err := mirasim.Probe(ctx, model)
+	err := mirasim.Probe(ctx, MirasimModelID(model))
 	r := Result{Protocol: Anthropic, Model: model, OK: err == nil, Millis: time.Since(start).Milliseconds()}
 	if err != nil {
 		r.Error = err.Error()
@@ -58,4 +58,17 @@ func mirasimTest(ctx context.Context, model string) Result {
 		r.Status = 200
 	}
 	return r
+}
+
+// Magpie groups use canonical IDs; the native Claude CLI needs its 1M marker.
+func MirasimModelID(model string) string {
+	if strings.HasPrefix(model, "claude-") && !strings.HasSuffix(model, "[1m]") {
+		ms, _, _ := catalog.Live("mirasim")
+		for _, m := range ms {
+			if m.ID == model && m.Context >= 1000000 {
+				return model + "[1m]"
+			}
+		}
+	}
+	return model
 }

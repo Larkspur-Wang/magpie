@@ -311,7 +311,7 @@ func claudeIn(at place) *Agent {
 						own = append(own, Option{Value: id, Label: m.Name})
 					}
 				}
-				return group("Mirasim Claude CLI", append(claudeOwn(), own...))
+				return group("Mirasim Claude CLI", own)
 			}
 			if u := env("ANTHROPIC_BASE_URL"); u != "" && !routed() {
 				name += " · " + hostOf(u)

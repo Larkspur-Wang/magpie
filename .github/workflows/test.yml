@@ -19,6 +19,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
+      - name: Install pinned Mirasim GPT dependency
+        run: npm ci --prefix plugins/mirasim-gpt --ignore-scripts --no-audit --no-fund
       - name: Plugin adapter tests
         run: node --test plugins/*/*.test.mjs
 

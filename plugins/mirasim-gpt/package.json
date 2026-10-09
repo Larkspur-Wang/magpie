@@ -1,0 +1,10 @@
+{
+  "name": "magpie-mirasim-gpt-adapter",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "index.mjs",
+  "dependencies": {
+    "opencode-mirasim-auth": "0.3.0"
+  }
+}

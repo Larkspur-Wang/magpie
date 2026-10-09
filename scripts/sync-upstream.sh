@@ -59,6 +59,7 @@ say "test (vet, go test, race, plugins)"
 go vet ./...
 go test ./...
 go test -race ./internal/gateway/ ./internal/redact/
+npm ci --prefix plugins/mirasim-gpt --ignore-scripts --no-audit --no-fund
 node --test plugins/*/*.test.mjs
 CGO_ENABLED=0 go build -tags nogui -o /dev/null .
 

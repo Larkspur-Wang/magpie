@@ -5,7 +5,9 @@
 //
 // In order: the proxy set in magpie's settings (or "direct" for none), the
 // usual *_PROXY variables, then the system's proxy (macOS network
-// settings, Windows Internet Options). Loopback is never proxied.
+// settings, Windows Internet Options). Loopback is never proxied, nor,
+// unless a provider has a proxy of its own, a host on the user's own
+// network (lan.go).
 package netproxy
 
 import (
@@ -32,27 +34,59 @@ func Install() {
 }
 
 // Func is an http.Transport Proxy function: the proxy the request's
-// context names (With), or else the global one.
+// context names (With), or else the global one, which a host on the
+// user's own network goes around (onLAN).
 func Func(req *http.Request) (*url.URL, error) {
+	if err := Held(req.Context()); err != nil {
+		return nil, err
+	}
 	if loopback(req.URL.Hostname()) {
 		return nil, nil
 	}
 	if c := choiceOf(req.Context()); c != "" {
 		return forChoice(c)
 	}
-	return For(req.URL)
+	p, err := For(req.URL)
+	if p != nil && onLAN(req.URL.Hostname()) {
+		return nil, nil
+	}
+	return p, err
 }
 
 type choiceKey struct{}
 
+type holdKey struct{}
+
+// Hold is ctx for work magpie was not asked to do and must not send: no
+// request made with it through Func, or a transport Dispatch made, leaves
+// the machine; each fails with err before it dials (#1518, allowance
+// reads while the user has them read only when asked).
+func Hold(ctx context.Context, err error) context.Context {
+	return context.WithValue(ctx, holdKey{}, err)
+}
+
+// Held is the error ctx holds its requests with (Hold), nil when it holds
+// none.
+func Held(ctx context.Context) error {
+	if ctx == nil {
+		return nil
+	}
+	err, _ := ctx.Value(holdKey{}).(error)
+	return err
+}
+
 // With is ctx for requests made on behalf of one provider, whose own proxy
 // is choice (issue #237: Codex through a proxy, a vendor at home without):
-// "" follows the global one (ctx is returned as it is), "direct" goes
-// through none, anything else is the proxy's address (http://, https://,
-// socks5://; host:port means http). Requests made with it through Func,
-// or through a transport Dispatch made, take that proxy.
+// "" follows the global one, "direct" goes through none, anything else is
+// the proxy's address (http://, https://, socks5://; host:port means
+// http). Requests made with it through Func, or through a transport
+// Dispatch made, take that proxy. A choice ctx already names is replaced,
+// "" too: a request magpie makes for one provider while serving another's
+// (a web search asked of Codex in a turn served by a provider set to
+// "direct", #1522) goes through its own provider's proxy, never the one
+// it was made under.
 func With(ctx context.Context, choice string) context.Context {
-	if choice = strings.TrimSpace(choice); choice == "" {
+	if choice = strings.TrimSpace(choice); choice == "" && choiceOf(ctx) == "" {
 		return ctx
 	}
 	return context.WithValue(ctx, choiceKey{}, choice)
@@ -83,8 +117,10 @@ func forChoice(c string) (*url.URL, error) {
 // base kept for that proxy alone. Connections are so reused among the
 // requests going through one proxy and never carried to another — HTTP/2
 // ones, which a transport shares by host whatever proxy they were dialled
-// through, among them.
+// through, among them. A host whose IPv6 is taken but goes nowhere is
+// dialed over IPv4 (v4Fallback).
 func Dispatch(base *http.Transport) http.RoundTripper {
+	v4Fallback(base)
 	return &dispatch{base: base, own: map[string]*http.Transport{}}
 }
 
@@ -97,9 +133,9 @@ type dispatch struct {
 func (d *dispatch) RoundTrip(req *http.Request) (*http.Response, error) {
 	c := choiceOf(req.Context())
 	if c == "" {
-		return d.base.RoundTrip(req)
+		return v4Retry(d.base, req)
 	}
-	return d.transport(c).RoundTrip(req)
+	return v4Retry(d.transport(c), req)
 }
 
 func (d *dispatch) transport(c string) *http.Transport {
@@ -116,6 +152,9 @@ func (d *dispatch) transport(c string) *http.Transport {
 	}
 	t := d.base.Clone()
 	t.Proxy = func(req *http.Request) (*url.URL, error) {
+		if err := Held(req.Context()); err != nil {
+			return nil, err
+		}
 		if loopback(req.URL.Hostname()) {
 			return nil, nil
 		}
@@ -262,7 +301,55 @@ func Describe() (proxy, source string) {
 	return "", "none"
 }
 
-func fromEnv(u *url.URL) (*url.URL, error) { return http.ProxyFromEnvironment(&http.Request{URL: u}) }
+// fromEnv is the proxy the environment names for u: HTTPS_PROXY or
+// HTTP_PROXY as Go reads them, else ALL_PROXY (curl's, which Go doesn't
+// read: a shell with only ALL_PROXY=socks5://… set has curl go through it,
+// and magpie, its updates among its requests, too). NO_PROXY is kept for
+// it as well.
+func fromEnv(u *url.URL) (*url.URL, error) {
+	if p, err := http.ProxyFromEnvironment(&http.Request{URL: u}); p != nil || err != nil {
+		return p, err
+	}
+	all := envOf("ALL_PROXY", "all_proxy")
+	if all == "" || noProxy(u.Hostname(), envOf("NO_PROXY", "no_proxy")) {
+		return nil, nil
+	}
+	return Parse(all)
+}
+
+func envOf(keys ...string) string {
+	for _, k := range keys {
+		if v := strings.TrimSpace(os.Getenv(k)); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// noProxy matches host against NO_PROXY as curl does: "*" for every host,
+// else entries apart by commas, each the host or a domain it is under
+// (example.com and .example.com both take api.example.com); a port on an
+// entry is ignored. Loopback is never proxied anyway.
+func noProxy(host, list string) bool {
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	if host == "" || loopback(host) {
+		return true
+	}
+	for _, e := range strings.Split(list, ",") {
+		e = strings.ToLower(strings.TrimSpace(e))
+		if e == "*" {
+			return true
+		}
+		if h, _, err := net.SplitHostPort(e); err == nil {
+			e = h
+		}
+		e = strings.TrimPrefix(strings.TrimPrefix(e, "*"), ".")
+		if e != "" && (host == e || strings.HasSuffix(host, "."+e)) {
+			return true
+		}
+	}
+	return false
+}
 
 // Proxy is the system's proxy: one address, and the hosts that skip it.
 type Proxy struct {
@@ -276,12 +363,27 @@ var sysCache struct {
 	p  Proxy
 }
 
-// System reads the system proxy, at most every 15 seconds.
+// How long a system proxy read stands: a proxy that is set, 15 seconds;
+// none, 2. magpie started at login comes up before the proxy app does
+// (#1518), and its requests went direct for up to 15 seconds after the
+// proxy app had set the system's proxy.
+var (
+	systemKeep = 15 * time.Second
+	noneKeep   = 2 * time.Second
+	readSystem = system
+)
+
+// System reads the system proxy, at most every 15 seconds while one is
+// set and every 2 while none is.
 func System() Proxy {
 	sysCache.Lock()
 	defer sysCache.Unlock()
-	if time.Since(sysCache.at) > 15*time.Second {
-		sysCache.p, sysCache.at = system(), time.Now()
+	keep := systemKeep
+	if sysCache.p.URL == "" {
+		keep = noneKeep
+	}
+	if sysCache.at.IsZero() || time.Since(sysCache.at) > keep {
+		sysCache.p, sysCache.at = readSystem(), time.Now()
 	}
 	return sysCache.p
 }

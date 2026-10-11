@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/plugin"
+	"github.com/yetone/magpie/internal/testenv"
 )
 
 // An account the vendor refused while it ran on the plugin goes back to
@@ -18,10 +19,7 @@ import (
 // (every real mover clears the mark there): the built-in had marked it
 // the same way, and it would show signed in until its next refusal.
 func TestMoveBackKeepsLapse(t *testing.T) {
-	bun, err := exec.LookPath("bun")
-	if err != nil {
-		t.Skip("no bun on PATH")
-	}
+	bun := testenv.Bun(t)
 	claudeHome(t)
 	t.Setenv("MAGPIE_BUN", bun)
 	t.Cleanup(plugin.Settle)
@@ -76,10 +74,7 @@ func TestMoveBackKeepsLapse(t *testing.T) {
 // on a refused model token) moves along marked, as the built-in would
 // have marked it on its own model read, and doesn't stop the move.
 func TestMoveRefusedWhileListing(t *testing.T) {
-	bun, err := exec.LookPath("bun")
-	if err != nil {
-		t.Skip("no bun on PATH")
-	}
+	bun := testenv.Bun(t)
 	claudeHome(t)
 	t.Setenv("MAGPIE_BUN", bun)
 	t.Cleanup(plugin.Settle)
@@ -114,6 +109,48 @@ func TestMoveRefusedWhileListing(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatalf("lapsed after the move: %v, want g@fake alone", lapsed)
 		}
+	}
+}
+
+// An account whose plugin says only in words that its sign-in has expired
+// (Grok's, past its time with no CLI to renew it) moves along untried and
+// unmarked, as a built-in Grok account never was marked; it used to stop
+// the whole move. A plugin failing an account for any other reason still
+// does (TestMove's r-dead).
+func TestMoveExpiredInWords(t *testing.T) {
+	bun := testenv.Bun(t)
+	claudeHome(t)
+	t.Setenv("MAGPIE_BUN", bun)
+	t.Cleanup(plugin.Settle)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	abs, _ := filepath.Abs("../plugin/testdata/fake/index.js")
+	if _, err := plugin.Add(ctx, abs); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := plugin.Providers(ctx); err != nil {
+		t.Fatal(err)
+	}
+	inUse := []string{"fake-1"}
+	fakeMover(t, &inUse)
+	movers["fakeco"].pkg = abs
+	loginsMu.Lock()
+	if err := writeLogins([]savedLogin{fakeLogin("a@fake", "r-a", true, true), fakeLogin("x@fake", "r-models-expired", false, true)}); err != nil {
+		t.Fatal(err)
+	}
+	loginsMu.Unlock()
+	if err := Move(ctx, "fakeco"); err != nil {
+		t.Fatalf("an expired sign-in stopped the move: %v", err)
+	}
+	users := map[string]bool{}
+	for _, l := range pluginLogins(mustPlugin(t)) {
+		users[l.User] = true
+		if l.Lapsed != "" {
+			t.Fatalf("%s marked lapsed: %q", l.User, l.Lapsed)
+		}
+	}
+	if !users["a@fake"] || !users["x@fake"] {
+		t.Fatalf("moved %v", users)
 	}
 }
 

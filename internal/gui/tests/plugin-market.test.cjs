@@ -63,7 +63,8 @@ function server(lang, asked) {
     }
     if (url.pathname === "/api/groups") return json({ groups: [], pools: [] });
     if (url.pathname === "/api/gateway/trace") return json({ routes: [] });
-    if (url.pathname === "/api/plugins/market") return json(market());
+    // the page asks for the market in parts (#488)
+    if (url.pathname === "/api/plugins/market" || url.pathname === "/api/plugins" || url.pathname === "/api/plugins/listings") { const m = market(); return json(url.pathname === "/api/plugins" ? m.state : url.pathname === "/api/plugins/listings" ? { listings: m.listings } : m); }
     if (url.pathname === "/api/plugins/search") {
       asked.push(["search", url.searchParams.get("q")]);
       return json({ hits: [
@@ -95,11 +96,11 @@ function server(lang, asked) {
 }
 
 const L = {
-  en: { tab: "Plugins", ours: "magpie community", install: "Install", soon: "Coming soon", signIn: "Sign in", onNpm: "On npm",
-    installed: "Installed", failed: /Didn't load: Cannot find module/, update: "Update", remove: "Remove", more: "More subscriptions", moreTile: "More in Plugins",
+  en: { tab: "Plugins", ours: "Subscriptions", install: "Install", soon: "Coming soon", signIn: "Sign in", onNpm: "On npm",
+    installed: "Installed", failed: /Didn't load: Cannot find module/, update: "Update", remove: "Remove", moreTile: "More in Plugins",
     lookFor: "look for a plugin", week: "48k/week", readme: "Install", signing: "GitHub Copilot" },
-  zh: { tab: "插件", ours: "magpie 社区", install: "安装", soon: "即将上线", signIn: "登录", onNpm: "npm 上的插件",
-    installed: "已安装", failed: /没有加载成功：Cannot find module/, update: "更新", remove: "移除", more: "更多订阅", moreTile: "插件中还有更多",
+  zh: { tab: "插件", ours: "订阅", install: "安装", soon: "即将上线", signIn: "登录", onNpm: "npm 上的插件",
+    installed: "已安装", failed: /没有加载成功：Cannot find module/, update: "更新", remove: "移除", moreTile: "插件中还有更多",
     lookFor: "找找插件", week: "48k/周", readme: "Install", signing: "GitHub Copilot" },
 };
 
@@ -122,14 +123,16 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         page.on("pageerror", (e) => errors.push(e.message));
         await page.route("**/*", server(lang, asked));
 
-        // the providers list's button leads to the Plugins tab
+        // the providers list has no way of its own there: the add sheet's
+        // Subscriptions has it, as its last row
         await page.goto("http://magpie.test/?view=providers");
-        const more = page.locator("#moreSubs");
-        await more.waitFor();
-        assert.match(await more.innerText(), new RegExp(w.more));
-        assert.equal(await more.locator(".stack .ic").count(), 3);
-        await shot(page.locator("#view-providers .after-list"), `plugins-button-${engine}-${lang}`);
-        await more.click();
+        await page.locator("#addProvider").waitFor();
+        assert.equal(await page.locator("#view-providers .after-list .more-subs").count(), 0);
+        await page.locator("#addProvider").click();
+        const row = page.locator("#addSheet .tile.more-plugins");
+        await row.waitFor();
+        await shot(page.locator("#addSheet"), `plugins-row-${engine}-${lang}`);
+        await row.click();
         const view = page.locator("#view-plugins");
         await view.waitFor({ state: "visible" });
         assert.equal(await page.locator('#nav button[data-view="plugins"]').getAttribute("class"), "on");
@@ -206,7 +209,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await q.fill("");
 
         // Installed: why one didn't load, an update, a removal
-        await view.locator(".lib-tabs .opt", { hasText: w.installed }).click();
+        await view.page().locator(":is(.lib-tabs .opt, .nav-s):visible", { hasText: w.installed }).click();
         const rows = view.locator(".pm-row");
         await rows.first().waitFor();
         assert.equal(await rows.count(), 2);
@@ -219,6 +222,8 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await cp.locator(".pm-chip.up").waitFor({ state: "detached" });
         assert.deepEqual(asked.find(([k]) => k === "upgrade")[1], { spec: "opencode-copilot-auth" });
         await rows.filter({ hasText: "opencode-broken" }).locator("button", { hasText: w.remove }).click();
+        assert.deepEqual(asked.filter(([k]) => k === "remove"), [], "Remove waits for confirmation");
+        await page.locator("dialog.action-confirm[open] button").last().click();
         await page.waitForFunction(() => document.querySelectorAll("#view-plugins .pm-row").length === 1);
         assert.equal(await view.evaluate((e) => e.scrollTop), top, "a click doesn't move the page");
 

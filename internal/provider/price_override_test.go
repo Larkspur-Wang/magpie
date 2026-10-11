@@ -16,6 +16,7 @@ func priceHome(t *testing.T) {
 	t.Helper()
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
 	catalog.Reset()
@@ -351,11 +352,11 @@ func TestSetModelPriceKeysByIdNotByTheNameUsedToAsk(t *testing.T) {
 	if !ok {
 		t.Fatalf("the price is not keyed by the provider's id either: %v", s.ModelPrices)
 	}
-	if p, bad := got.Price(); bad != "" || p != pr {
+	if p, bad := got.Price(); bad != "" || !p.Same(pr) {
 		t.Errorf("the price stored under the id reads back as %+v (bad part %q), want %+v", p, bad, pr)
 	}
 	// and it is the price the model is counted at, which was the point
-	if eff, ok := EffectivePrice("relay", "sol"); !ok || eff != pr {
+	if eff, ok := EffectivePrice("relay", "sol"); !ok || !eff.Same(pr) {
 		t.Errorf("the model is counted at %+v, %v; want the price just set %+v", eff, ok, pr)
 	}
 	// taking it away by either name clears the one entry

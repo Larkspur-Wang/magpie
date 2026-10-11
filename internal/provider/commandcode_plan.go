@@ -1,5 +1,15 @@
 package provider
 
+// PLUGIN-SERVED (see AGENTS.md): Command Code's plan ("commandcode-plan") is
+// a deprecated built-in subscription served by its plugin,
+// @magpie-community/opencode-commandcode-auth, once moved onto it
+// (provider.Moved; the default for a new sign-in). A moved one's sign-ins,
+// models, requests and usage are all the plugin's, never this code's (only
+// the move, in migrate*.go, still reads its accounts). A fix here alone
+// doesn't reach those users; fix the plugin
+// (github.com/magpie-community/plugins, packages/commandcode) and raise the
+// mover's min in internal/provider/migrate_side.go.
+
 // A Command Code subscription is a commandcode.ai plan (Pro, GOAT, Max,
 // Ultra — every one but Go comes with API access). Signing in to it, as
 // `cmd auth login` does, mints an API key for the account; that key is
@@ -41,6 +51,22 @@ import (
 
 // CommandCodePlanID is the subscription's id, and its sign-in's.
 const CommandCodePlanID = "commandcode-plan"
+
+// CommandCodeMaxOutput is the most max_tokens Command Code takes at
+// /alpha/generate, for any model: more is refused ("Too big: expected
+// number to be <=200000 at params.max_tokens"). models.dev gives some of
+// its models more (DeepSeek V4's 384000, MiniMax M3's 512000).
+const CommandCodeMaxOutput = 200_000
+
+// CommandCodeOutputOf is the most a reply of a Command Code model may be
+// asked for: the model's own limit, as models.dev gives it, within
+// CommandCodeMaxOutput.
+func CommandCodeOutputOf(model string) int {
+	if n := catalog.OutputOf(model); n > 0 && n < CommandCodeMaxOutput {
+		return n
+	}
+	return CommandCodeMaxOutput
+}
 
 // Where Command Code's API and its sign-in page are; vars so tests can
 // point them elsewhere.
@@ -168,8 +194,33 @@ func cmdGoFetch(ctx context.Context) ([]catalog.Model, error) {
 	if len(out) == 0 {
 		return nil, errors.New("Command Code listed no models for the Go plan")
 	}
+	cmdMarkFree(out)
 	return out, catalog.SaveLive(CommandCodePlanID, base, out)
 }
+
+// cmdFree are the models Command Code's CLI marks FREE in its picker
+// (1.73.2: badge:"free", "{name} is free and uses shared capacity"); its
+// API's list doesn't say so, and Space Bunny Alpha's and Pixel Canary's
+// ids name nothing free. Neither says a model is served at a discount.
+var cmdFree = map[string]bool{
+	"stealth/space-bunny-alpha": true, "stealth/pixel-canary": true,
+	"poolside/laguna-s-2.1-free": true, "inclusionai/ling-3.0-flash-free": true,
+	"inclusionai/ling-3.0-flash-sante:free": true, "inclusionai/ling-3.1-flash:free": true,
+	"MiniMaxAI/MiniMax-M3-Free": true, "minimax/minimax-m3-free": true,
+	"minimax/minimax-m2.7-free": true, "meituan/LongCat-2.0:free": true, "tencent/Hy3": true,
+}
+
+// cmdMarkFree marks the models of ms the CLI calls free, in place.
+func cmdMarkFree(ms []catalog.Model) []catalog.Model {
+	for i := range ms {
+		if cmdFree[ms[i].ID] {
+			ms[i].Free = true
+		}
+	}
+	return ms
+}
+
+func init() { cmdMarkFree(cmdGoModels) }
 
 // cmdAuth is an account's key, as auth.json and the sign-in name it.
 type cmdAuth struct {
@@ -303,7 +354,12 @@ func cmdProvider(who, plan string, a cmdAuth) Provider {
 		}
 		keyed := p
 		keyed.Account, keyed.Key = nil, a.APIKey
-		return keyed.Fetch(ctx)
+		ms, base, err := keyed.fetchOne(keyed.Via(ctx))
+		if err != nil {
+			return nil, err
+		}
+		cmdMarkFree(ms)
+		return catalog.Chat(ms), catalog.SaveLive(p.ID, base, ms)
 	}
 	acct.generate = func(ctx context.Context) (string, bool) {
 		return a.APIKey, cmdPlanNow(ctx, a, plan) == "Go"
@@ -616,6 +672,9 @@ func startCommandCodeSignIn(s *signInFlow) error {
 	srv := &http.Server{Handler: http.HandlerFunc(s.commandCodeCallback), ReadHeaderTimeout: 10 * time.Second}
 	s.mu.Lock()
 	s.st.URL = cmdStudio + "/studio/auth/cli?" + q.Encode()
+	// Studio's post can't reach a magpie on a server or in Docker: a key
+	// made on its keys page and pasted finishes it instead
+	s.st.PasteKey, s.st.KeysURL = true, cmdKeysURL
 	s.srv = srv
 	s.mu.Unlock()
 	go func() { _ = srv.Serve(ln) }()
@@ -716,15 +775,31 @@ func (s *signInFlow) commandCodeCallback(w http.ResponseWriter, r *http.Request)
 		answer(false, "Command Code sent back no key")
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	if !s.claim() {
+		// a key was pasted too, and that one is being kept
+		answer(false, "this sign-in is already finishing")
+		return
+	}
+	ctx, cancel := context.WithTimeout(s.via(r.Context()), 30*time.Second)
 	defer cancel()
-	who, plan, err := cmdSignedIn(ctx, got.cmdAuth)
-	if err != nil {
-		s.finish(SignInState{State: "failed", Error: err.Error()})
+	// the browser comes back for its page after this: the server stays up
+	// a while for it, where finish would close it within a second
+	if err := s.commandCodeKeep(ctx, got.cmdAuth, true); err != nil {
 		answer(false, err.Error())
 		return
 	}
-	a := got.cmdAuth
+	answer(true, "")
+}
+
+// commandCodeKeep names the account a key is Command Code's, keeps it beside
+// the others, and finishes the sign-in. keepServer leaves the callback
+// server up a while, for the browser to come back for its page.
+func (s *signInFlow) commandCodeKeep(ctx context.Context, a cmdAuth, keepServer bool) error {
+	who, plan, err := cmdSignedIn(ctx, a)
+	if err != nil {
+		s.finish(SignInState{State: "failed", Error: err.Error()})
+		return err
+	}
 	a.UserName = who
 	auth, _ := json.Marshal(a)
 	ownUser, _, hasOwn := cmdOwn()
@@ -733,20 +808,49 @@ func (s *signInFlow) commandCodeCallback(w http.ResponseWriter, r *http.Request)
 	}
 	if err := addSideLogin(savedLogin{Agent: CommandCodePlanID, User: who, Plan: plan, Auth: auth}, ownUser, func(savedLogin) {}); err != nil {
 		s.finish(SignInState{State: "failed", Error: err.Error()})
-		answer(false, err.Error())
-		return
+		return err
 	}
-	// the browser comes back for its page after this: the server stays up
-	// a while for it, where finish would close it within a second
-	s.mu.Lock()
-	srv := s.srv
-	s.srv = nil
-	s.mu.Unlock()
-	if srv != nil {
-		time.AfterFunc(10*time.Second, func() { _ = srv.Close() })
+	if keepServer {
+		s.mu.Lock()
+		srv := s.srv
+		s.srv = nil
+		s.mu.Unlock()
+		if srv != nil {
+			time.AfterFunc(10*time.Second, func() { _ = srv.Close() })
+		}
 	}
 	s.finish(SignInState{State: "done", User: who, Plan: plan, Using: hasOwn && strings.EqualFold(ownUser, who)})
-	answer(true, "")
+	return nil
+}
+
+// cmdKeysURL is Studio's page of API keys, where one is made to paste.
+var cmdKeysURL = "https://commandcode.ai/settings/keys"
+
+// commandCodeKey finishes a sign-in with a key pasted from Studio's keys
+// page, as the CLI takes one ("Authorize in browser, or paste API key
+// here"). It is how a magpie the browser can't reach — on a server, in
+// Docker — signs in: Studio posts the key to the callback on 127.0.0.1 in
+// the background, so the page the browser ends on has nothing in its
+// address to paste.
+func (s *signInFlow) commandCodeKey(raw string) error {
+	key := strings.TrimSpace(raw)
+	switch {
+	case key == "":
+		return errors.New("paste an API key from Command Code's keys page")
+	case strings.Contains(key, "://"):
+		return errors.New("that's an address: Command Code sends its key in the background, so make a key on its keys page and paste that")
+	case strings.ContainsAny(key, " \t\r\n"):
+		return errors.New("that doesn't look like a Command Code API key")
+	}
+	if s.status().State != "waiting" {
+		return errors.New("this sign-in is over; start it again")
+	}
+	if !s.claim() {
+		return errors.New("this sign-in is already finishing")
+	}
+	ctx, cancel := context.WithTimeout(s.via(context.Background()), 30*time.Second)
+	defer cancel()
+	return s.commandCodeKeep(ctx, cmdAuth{APIKey: key}, false)
 }
 
 // cmdSignedIn names a new key's account with whoami, and reads its plan.

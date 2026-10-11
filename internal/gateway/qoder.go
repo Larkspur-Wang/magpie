@@ -1,5 +1,14 @@
 package gateway
 
+// PLUGIN-SERVED (see AGENTS.md): Qoder ("qoder") and Qoder CN ("qoder-cn")
+// are deprecated built-in subscriptions served by their plugin,
+// @magpie-community/opencode-qoder-auth, each once moved onto it
+// (provider.Moved; the default for a new sign-in). A moved one's
+// sign-ins, models, requests and usage are all the plugin's, never this
+// code's (only the move, in migrate*.go, still reads its accounts). A fix here alone doesn't reach those users; fix the plugin
+// (github.com/magpie-community/plugins, packages/qoder) and raise the
+// movers' min in internal/provider/migrate_qoder.go.
+
 import (
 	"bufio"
 	"cmp"
@@ -56,6 +65,8 @@ func (s *Server) serveQoder(w http.ResponseWriter, r *http.Request, from provide
 	if err != nil {
 		return writeError(w, from, 400, err.Error()), err.Error()
 	}
+	// the vendor's own API is told the answer's format in words
+	req = req.inSystem()
 	req.Model = model
 	ask := s.askQoder(p.Account.Agent, model, p.Account.User)
 	ctx, cancel := context.WithCancel(r.Context())
@@ -63,7 +74,7 @@ func (s *Server) serveQoder(w http.ResponseWriter, r *http.Request, from provide
 	q := req
 	var tool string
 	if req.WebSearch && !searching(r.Context()) {
-		if _, _, ok := searcher(); ok {
+		if canSearch() {
 			copy := *req
 			copy.WebSearch = false
 			search := searchTool(copy.Tools)
@@ -120,22 +131,28 @@ func relayStatus(w http.ResponseWriter, from provider.Protocol, name string, req
 		if len(head) == 0 || head[len(head)-1].Kind == KStart || head[len(head)-1].Kind == KUsage {
 			return fail(Event{Text: name + " ended without an answer"})
 		}
-		enc := encoder(from, newSSEWriter(w), req)
+		sw := newSSEWriter(w)
+		enc := encoder(from, sw, req, usage)
+		var failed string
 		see := func(ev Event) bool {
 			if ev.Kind == KStart || ev.Kind == KUsage {
 				usage.add(ev.Usage)
 			}
 			enc.event(ev)
-			return ev.Kind != KError
+			if ev.Kind == KError {
+				failed = ev.Text
+				return false
+			}
+			return true
 		}
 		for _, ev := range head {
 			see(ev)
 		}
-		for ev := range events {
-			if !see(ev) {
-				abort()
-				return 200, ev.Text
-			}
+		// kept from the client's idle timeout while none comes (#436)
+		relayEvents(events, sw, enc, see)
+		if failed != "" {
+			abort()
+			return 200, failed
 		}
 		enc.finish()
 		return 200, ""
@@ -151,7 +168,7 @@ func relayStatus(w http.ResponseWriter, from provider.Protocol, name string, req
 	usage.add(res.Usage)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(200)
-	w.Write(render(from, res, req))
+	w.Write(renderUsage(from, res, req, usage))
 	return 200, ""
 }
 
@@ -201,6 +218,7 @@ func (s *Server) askQoder(agent, model, user string) round {
 		if err != nil {
 			return nil, 502, "Qoder: " + err.Error()
 		}
+		res = notAnAPIReply(res, "") // a web page served 200 (#1012)
 		if res.StatusCode/100 != 2 {
 			b, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
 			res.Body.Close()

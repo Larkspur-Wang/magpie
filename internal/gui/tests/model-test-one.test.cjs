@@ -22,6 +22,8 @@ const relay = {
 };
 const answer = (id) => id.startsWith("anthropic/")
   ? { ok: false, status: 404, error: "no such model", model: id }
+  : id === "model-c"
+  ? { ok: true, ms: 1234, model: id }
   : { ok: true, ms: 123, model: id };
 
 function serve(lang, tests) {
@@ -51,11 +53,13 @@ const words = {
   en: {
     item: "Test this model", all: "Test models",
     bad: "anthropic/claude-opus-4.5 didn't answer: 404 · no such model", ok: "gpt-5.1 answered in 123 ms", okTitle: "Answered in 123 ms",
+    okSeconds: "model-c answered in 1.2 s", okSecondsTitle: "Answered in 1.2 s",
     tip: "Right-click to test just this model",
   },
   zh: {
     item: "测试此模型", all: "测试模型",
     bad: "anthropic/claude-opus-4.5 没有响应：404 · no such model", ok: "gpt-5.1 在 123 毫秒内响应", okTitle: "123 毫秒内响应",
+    okSeconds: "model-c 在 1.2 秒内响应", okSecondsTitle: "1.2 秒内响应",
     tip: "右键可单独测试这个模型",
   },
 };
@@ -83,6 +87,8 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await page.locator(".editor .mchips .mchip").first().waitFor();
       const chip = (id) => page.locator(".editor .mchips .mchip", { hasText: id });
       const menu = page.locator(".pop.row-menu");
+      // which models, the editor's form aside (see provider-typed)
+      const asked = (b) => ({ id: b.id, test: b.test });
       const wait = async (n) => { for (let i = 0; i < 60 && tests.length < n; i++) await page.waitForTimeout(50); };
       const picked = () => page.locator(".editor .mchips .mchip.on").count();
 
@@ -104,7 +110,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await menu.getByRole("menuitem", { name: w.item }).click();
         await wait(n + 1);
         assert(await menu.count() === 0, "the menu closes");
-        return tests.at(-1);
+        return asked(tests.at(-1));
       };
 
       let sent = await tryOne("anthropic/claude-opus-4.5");
@@ -121,24 +127,31 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert.equal(await chip("anthropic/claude-opus-4.5").locator(".tdot.bad").count(), 1, "the first model's result is kept");
       assert.equal(await page.locator("#status").textContent(), w.ok);
 
+      // a model taking over 1s formats in seconds
+      sent = await tryOne("model-c");
+      assert.deepEqual(sent, { id: "relay", test: ["model-c"] });
+      await chip("model-c").locator(".tdot.ok").waitFor();
+      assert((await chip("model-c").getAttribute("title")).startsWith(w.okSecondsTitle));
+      assert.equal(await page.locator("#status").textContent(), w.okSeconds);
+
       // Esc closes the menu, nothing sent
-      await chip("model-c").click({ button: "right" });
+      await chip("gpt-5.1").click({ button: "right" });
       await menu.waitFor();
       const border = await page.evaluate(() => [...document.querySelectorAll(".pop.row-menu, .pop.row-menu *")].map((e) => getComputedStyle(e).borderLeftWidth).filter((b) => parseFloat(b) > 1));
       assert.deepEqual(border, [], "no left-border accent");
       await page.keyboard.press("Escape");
       await menu.waitFor({ state: "detached" });
-      assert.equal(tests.length, 2);
+      assert.equal(tests.length, 3);
       assert(await page.locator(".editor").isVisible(), "Esc closed the menu, not the editor");
 
       // Test models still asks every one
       await page.locator(".editor .mfoot").getByRole("button", { name: w.all, exact: true }).click();
       await wait(3);
-      assert.deepEqual(tests.at(-1), { id: "relay", test: IDS });
+      assert.deepEqual(asked(tests.at(-1)), { id: "relay", test: IDS });
 
       const missing = await page.evaluate(() => [
         "Test this model", "Right-click to test just this model", "Right-click a model to test just it",
-        "{model} answered in {ms} ms", "{model} didn't answer: {error}",
+        "{model} answered in {took}", "{model} didn't answer: {error}", "Answered in {took}",
       ].filter((k) => !I18N.zh[k]));
       assert.deepEqual(missing, [], "every string has its Chinese");
       assert.deepEqual(errors, []);

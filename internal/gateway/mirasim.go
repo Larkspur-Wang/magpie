@@ -11,8 +11,8 @@ import (
 )
 
 func (s *Server) serveMirasim(w http.ResponseWriter, r *http.Request, from provider.Protocol, p provider.Provider, model string, body []byte, usage *Usage) (int, string) {
+	owner := p.ID + "\x00" + p.Account.User
 	start := func(ctx context.Context, req *Request) (*subscriptionRun, <-chan Event, error) {
-		owner := p.ID + "\x00" + p.Account.User
 		if run, events := s.subscription.resume(req, owner); run != nil {
 			return run, events, nil
 		}
@@ -25,5 +25,5 @@ func (s *Server) serveMirasim(w http.ResponseWriter, r *http.Request, from provi
 		env = append(env, "MIRASIM_QUIET=1")
 		return s.subscription.startCommand(req, provider.MirasimModelID(model), owner, c.Binary, c.With("claude"), env)
 	}
-	return s.serveSubscription(w, r, from, "Mirasim Claude", model, body, usage, start)
+	return s.serveSubscription(w, r, from, "Mirasim Claude", model, owner, body, usage, start)
 }

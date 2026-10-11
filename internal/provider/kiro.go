@@ -1,5 +1,14 @@
 package provider
 
+// PLUGIN-SERVED (see AGENTS.md): Kiro ("kiro") is a deprecated built-in
+// subscription served by its plugin, @magpie-community/opencode-kiro-auth,
+// once moved onto it (provider.Moved; the default for a new sign-in). A
+// moved one's sign-ins, models, requests and usage are all the plugin's,
+// never this code's (only the move, in migrate*.go, still reads its
+// accounts). A fix here alone doesn't reach those users; fix the plugin
+// (github.com/magpie-community/plugins, packages/kiro) and raise the mover's
+// min in internal/provider/migrate_kiro.go.
+
 // A Kiro subscription is used through Kiro's own API, the one kiro-cli
 // talks to (gateway/kiro.go speaks it), with the sign-in kiro-cli or the
 // Kiro IDE already has: kiro-cli keeps its tokens in its SQLite database,
@@ -30,9 +39,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/proc"
+	"github.com/yetone/magpie/internal/settings"
+	"github.com/yetone/magpie/internal/steady"
 )
 
 // KiroExecutable finds kiro-cli, which refreshes its own sign-in; a var so
@@ -43,8 +55,8 @@ var KiroExecutable = func() string {
 		return p
 	}
 	home, _ := os.UserHomeDir()
-	for _, p := range []string{filepath.Join(home, ".local", "bin", "kiro-cli"),
-		"/Applications/Kiro CLI.app/Contents/MacOS/kiro-cli", "/usr/local/bin/kiro-cli", "/opt/homebrew/bin/kiro-cli"} {
+	for _, p := range append([]string{filepath.Join(home, ".local", "bin", "kiro-cli")}, proc.SystemDirs(
+		"/Applications/Kiro CLI.app/Contents/MacOS/kiro-cli", "/usr/local/bin/kiro-cli", "/opt/homebrew/bin/kiro-cli")...) {
 		if st, err := os.Stat(p); err == nil && !st.IsDir() {
 			return p
 		}
@@ -58,7 +70,7 @@ var kiroCLIDB = func() string {
 	home, _ := os.UserHomeDir()
 	switch runtime.GOOS {
 	case "windows":
-		dir := os.Getenv("APPDATA")
+		dir := appdir.Getenv("APPDATA")
 		if dir == "" {
 			dir = filepath.Join(home, "AppData", "Roaming")
 		}
@@ -96,6 +108,7 @@ type kiroCred struct {
 	clientSecret    string    // idc
 	tokenURL        string    // external-idp
 	social          bool      // an IDE sign-in with Google or GitHub
+	builderID       bool      // an AWS Builder ID sign-in, which has no profile of its own
 
 	dbKey   string // the auth_kv row it came from
 	idePath string // or the IDE's file
@@ -109,6 +122,9 @@ func (c kiroCred) fresh() bool {
 // (Builder ID, IAM Identity Center), or with a company's own identity
 // provider.
 func readKiroCLI() (kiroCred, bool) {
+	if settings.AccountDiscoveryOff() {
+		return kiroCred{}, false
+	}
 	path := kiroCLIDB()
 	if !fileExists(path) {
 		return kiroCred{}, false
@@ -144,6 +160,8 @@ func readKiroCLI() (kiroCred, bool) {
 			c.method = "social"
 		case "odic":
 			c.method = "idc"
+			// as kiro-cli tells them apart: Builder ID's start URL, or none
+			c.builderID = str(m, "start_url") == "" || str(m, "start_url") == kiroBuilderIDStart
 			if reg := get("kirocli:odic:device-registration"); reg != nil {
 				c.clientID, c.clientSecret = str(reg, "client_id"), str(reg, "client_secret")
 			}
@@ -164,6 +182,9 @@ func readKiroCLI() (kiroCred, bool) {
 
 // readKiroIDE reads the Kiro IDE's sign-in.
 func readKiroIDE() (kiroCred, bool) {
+	if settings.AccountDiscoveryOff() {
+		return kiroCred{}, false
+	}
 	path := filepath.Join(kiroIDEDir(), "kiro-auth-token.json")
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -176,12 +197,14 @@ func readKiroIDE() (kiroCred, bool) {
 		Region       string `json:"region"`
 		ClientIDHash string `json:"clientIdHash"`
 		AuthMethod   string `json:"authMethod"`
+		Provider     string `json:"provider"`
 		ProfileArn   string `json:"profileArn"`
 	}
 	if json.Unmarshal(b, &t) != nil || t.AccessToken == "" {
 		return kiroCred{}, false
 	}
-	c := kiroCred{access: t.AccessToken, refresh: t.RefreshToken, region: t.Region, profile: t.ProfileArn, method: "idc", idePath: path}
+	c := kiroCred{access: t.AccessToken, refresh: t.RefreshToken, region: t.Region, profile: t.ProfileArn, method: "idc", idePath: path,
+		builderID: strings.EqualFold(t.Provider, "BuilderId")}
 	c.expires, _ = time.Parse(time.RFC3339Nano, t.ExpiresAt)
 	if c.region == "" {
 		c.region = "us-east-1"
@@ -221,6 +244,9 @@ func readKiroAt(key, home string) (kiroCred, bool) {
 	if key != "" {
 		return kiroCred{access: key, method: "apikey", region: "us-east-1"}, true
 	}
+	if settings.AccountDiscoveryOff() {
+		return kiroCred{}, false
+	}
 	if home != "" {
 		return readKiroFile(filepath.Join(home, kiroTokenFile))
 	}
@@ -228,13 +254,6 @@ func readKiroAt(key, home string) (kiroCred, bool) {
 		return c, true
 	}
 	return readKiroIDE()
-}
-
-// kiroSignedIn is whether there is a Kiro sign-in to use, without asking
-// anyone.
-func kiroSignedIn(key string) bool {
-	_, ok := readKiro(key)
-	return ok
 }
 
 // KiroAuth is what a call to Kiro's API is made with.
@@ -460,11 +479,7 @@ func writeFileAtomic(path string, b []byte) error {
 	if err != nil {
 		return err
 	}
-	tmp := path + ".magpie-tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return steady.WriteFile(path, b, 0o600) // on the disk before it is renamed in (#1505)
 }
 
 // kiroPost posts to a sign-in endpoint.
@@ -493,10 +508,14 @@ func kiroPost(ctx context.Context, u, contentType string, body []byte, headers m
 	return json.Unmarshal(b, dst)
 }
 
+// kiroManagementURL is where Kiro's management API is in a region; a var so
+// tests can answer it.
+var kiroManagementURL = func(region string) string { return "https://management." + region + ".kiro.dev/" }
+
 // kiroManagement calls Kiro's management API: GET with a query, or POST
 // with a JSON body when body is set.
 func kiroManagement(ctx context.Context, region, token, tokenType, method string, q url.Values, body any, dst any) error {
-	u := "https://management." + region + ".kiro.dev/" + method
+	u := kiroManagementURL(region) + method
 	verb := http.MethodGet
 	var rd io.Reader
 	if body != nil {
@@ -542,11 +561,21 @@ func (e *kiroStatusError) Error() string {
 	return "Kiro: " + http.StatusText(e.status)
 }
 
+// A Builder ID sign-in has no profile of its own, and Kiro won't list one
+// for it (List-Available-Profiles is a 403, "AWS Builder ID is not supported
+// for this operation"); the Kiro IDE and kiro-cli name this service profile
+// for it instead, so its models, usage and chat are asked with it too.
+const (
+	kiroBuilderIDStart   = "https://view.awsapps.com/start"
+	kiroBuilderIDProfile = "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX"
+)
+
 // kiroProfile finds the profile a sign-in that doesn't name one uses: an
-// API key's own, or the first Kiro lists in either of its regions.
+// API key's own, Builder ID's, or the first Kiro lists in either of its
+// regions.
 func kiroProfile(ctx context.Context, c kiroCred) (string, error) {
 	if c.method == "apikey" {
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://management.us-east-1.kiro.dev/", strings.NewReader("{}"))
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, kiroManagementURL("us-east-1"), strings.NewReader("{}"))
 		if err != nil {
 			return "", err
 		}
@@ -572,6 +601,9 @@ func kiroProfile(ctx context.Context, c kiroCred) (string, error) {
 		}
 		return out.Profile.Arn, nil
 	}
+	if c.builderID {
+		return kiroBuilderIDProfile, nil
+	}
 	tt := ""
 	if c.method == "external-idp" {
 		tt = "EXTERNAL_IDP"
@@ -584,6 +616,11 @@ func kiroProfile(ctx context.Context, c kiroCred) (string, error) {
 			} `json:"profiles"`
 		}
 		if err := kiroManagement(ctx, region, c.access, tt, "List-Available-Profiles", nil, map[string]any{}, &out); err != nil {
+			// a Builder ID sign-in the token didn't say was one
+			var se *kiroStatusError
+			if c.method == "idc" && errors.As(err, &se) && se.status == http.StatusForbidden && strings.Contains(se.body, "Builder ID") {
+				return kiroBuilderIDProfile, nil
+			}
 			last = err
 			continue
 		}
@@ -751,6 +788,10 @@ func (l kiroLimits) windows() []QuotaWindow {
 // magpie signed in in home, or Kiro's own sign-in's.
 func kiroQuotaAt(ctx context.Context, key, home string) SubscriptionQuota {
 	q := SubscriptionQuota{Provider: "kiro", Name: "Kiro", Icon: "kiro-color", Windows: []QuotaWindow{}}
+	if holding(ctx) {
+		q.Error = errNotAsked.Error()
+		return q
+	}
 	a, err := KiroAuthOf(ctx, key, home, false)
 	if err != nil {
 		q.Error = err.Error()
@@ -794,8 +835,9 @@ func kiroIdentity(key, home string) (user, plan string) {
 	}
 	if time.Since(s.at) > 5*time.Minute && !s.refreshing {
 		s.refreshing = true
+		ask := askKiroIdentity // read here: a test puts its own back meanwhile
 		go func() {
-			u, p := askKiroIdentity(key, home)
+			u, p := ask(key, home)
 			kiroStatus.Lock()
 			if u != "" || p != "" {
 				s.user, s.plan = u, p

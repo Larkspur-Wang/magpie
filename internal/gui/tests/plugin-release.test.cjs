@@ -33,7 +33,8 @@ function server(lang, asked) {
     }
     if (url.pathname === "/api/groups") return json({ groups: [], pools: [] });
     if (url.pathname === "/api/gateway/trace") return json({ routes: [] });
-    if (url.pathname === "/api/plugins/market") return json(market());
+    // the page asks for the market in parts (#488)
+    if (url.pathname === "/api/plugins/market" || url.pathname === "/api/plugins" || url.pathname === "/api/plugins/listings") { const m = market(); return json(url.pathname === "/api/plugins" ? m.state : url.pathname === "/api/plugins/listings" ? { listings: m.listings } : m); }
     if (url.pathname === "/api/plugins/remove" || url.pathname === "/api/plugins/off") {
       const b = body();
       asked.push([url.pathname.split("/").pop(), b]);
@@ -82,7 +83,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await page.locator('#nav button[data-view="plugins"]').click();
         const view = page.locator("#view-plugins");
         await view.waitFor({ state: "visible" });
-        await view.locator(".lib-tabs .opt", { hasText: w.installed }).click();
+        await view.page().locator(":is(.lib-tabs .opt, .nav-s):visible", { hasText: w.installed }).click();
         const zed = view.locator(".pm-row").filter({ hasText: "Zed" });
         const chip = zed.locator(".pm-chip.moved");
         await chip.waitFor();

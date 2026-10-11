@@ -13,8 +13,12 @@ func codexHome(t *testing.T, auth, config string) (home string, read func() stri
 	t.Helper()
 	home = t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+	// an app's data on Linux (Grok App's, #1668)
+	t.Setenv("XDG_DATA_HOME", filepath.Join(home, ".local", "share"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(home, ".local", "state"))
 	t.Setenv("CODEX_HOME", "")
 	t.Setenv("HANA_HOME", "")
 	// folders an agent's own variable moves out of the sandbox home
@@ -208,6 +212,88 @@ func TestCodexSubagentModel(t *testing.T) {
 	}
 }
 
+// #1633 (laacmilan): the model magpie puts every Codex subagent on offers
+// another provider's models, not only a ChatGPT account's, and takes one;
+// one of Codex's own bare names, which magpie can't put a request on, is
+// refused.
+func TestCodexSubagentModelTakesAnyProvider(t *testing.T) {
+	home, _ := codexHome(t, `{"tokens":{"access_token":"x","id_token":"x.e30.x"}}`, "model = \"gpt-5.5\"\n")
+	sub := codex(home).Field("subagent_model")
+	if sub == nil {
+		t.Fatal("no subagent model field")
+	}
+	offered := false
+	for _, o := range sub.Options(nil) {
+		offered = offered || o.Value == "fake/m1"
+	}
+	if !offered {
+		t.Fatalf("fake/m1 not offered: %+v", sub.Options(nil))
+	}
+	if err := sub.Set("fake/m1"); err != nil {
+		t.Fatal(err)
+	}
+	if got := sub.Get(); got != "fake/m1" {
+		t.Fatalf("subagent model = %q", got)
+	}
+	if err := sub.Set("gpt-5.5"); err == nil {
+		t.Error("a bare name of Codex's own was taken")
+	}
+	if err := sub.Set(""); err != nil || sub.Get() != "" {
+		t.Fatalf("Default: %v %q", err, sub.Get())
+	}
+}
+
+// Subagents can start at an effort of their own (#469): Codex's [agents]
+// default_subagent_reasoning_effort, used when a spawn names none. Codex
+// refuses a spawn at a level the subagents' model lacks, so magpie takes
+// only one it has, and drops one a new subagent model doesn't.
+func TestCodexSubagentEffort(t *testing.T) {
+	home, read := codexHome(t, "", "model = \"gpt-a\"\n\n[agents]\nmax_threads = 6\n")
+	os.WriteFile(filepath.Join(home, ".codex", "models_cache.json"), []byte(`{"models":[
+		{"slug":"gpt-a","display_name":"A","priority":1,"supported_reasoning_levels":[{"effort":"low"},{"effort":"medium"},{"effort":"high"},{"effort":"xhigh"}]},
+		{"slug":"gpt-mini","display_name":"Mini","priority":2,"supported_reasoning_levels":[{"effort":"low"},{"effort":"medium"}]}]}`), 0o644)
+	cx := codex(home)
+	eff := cx.Field("subagent_effort")
+	if eff == nil {
+		t.Fatal("no subagent effort field")
+	}
+	if eff.Get() != "" {
+		t.Fatalf("unset effort = %q", eff.Get())
+	}
+	if err := eff.Set("xhigh"); err != nil {
+		t.Fatal(err)
+	}
+	if cfg := read(); !strings.Contains(cfg, `default_subagent_reasoning_effort = "xhigh"`) || !strings.Contains(cfg, "max_threads = 6") {
+		t.Fatalf("\n%s", cfg)
+	}
+	// on a model that stops at medium, xhigh would fail every spawn
+	if err := cx.Field("subagent").Set("gpt-mini"); err != nil {
+		t.Fatal(err)
+	}
+	if got := eff.Get(); got != "" {
+		t.Fatalf("effort the subagent model lacks kept: %q\n%s", got, read())
+	}
+	if err := eff.Set("high"); err == nil {
+		t.Error("an effort gpt-mini lacks was taken")
+	}
+	var levels []string
+	for _, o := range eff.Options(nil) {
+		levels = append(levels, o.Value)
+	}
+	if strings.Join(levels, ",") != "low,medium" {
+		t.Fatalf("options = %v", levels)
+	}
+	if err := eff.Set("low"); err != nil {
+		t.Fatal(err)
+	}
+	if err := eff.Set(""); err != nil {
+		t.Fatal(err)
+	}
+	if cfg := read(); strings.Contains(cfg, "default_subagent_reasoning_effort") || !strings.Contains(cfg, `default_subagent_model = "gpt-mini"`) {
+		t.Fatalf("\n%s", cfg)
+	}
+}
+
 func TestCodexSubagentReadErrorStopsChanges(t *testing.T) {
 	const input = "model = \"fake/m1\"\nmodel_provider = \"magpie\"\n\n[agents]\ndefault_subagent_model = [\n"
 	for _, model := range []string{"", "gpt-native"} {
@@ -261,7 +347,7 @@ func TestCodexLoginAPI(t *testing.T) {
 	if login == nil {
 		t.Fatal("no login field")
 	}
-	if err := login.Set("chatgpt"); err == nil {
+	if err := login.Set("oauth"); err == nil {
 		t.Error("an unknown sign-in was taken")
 	}
 	if err := login.Set("api"); err != nil {

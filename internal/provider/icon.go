@@ -17,6 +17,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/yetone/magpie/internal/iconproxy"
 )
 
 // A provider's own picture lives in the icons folder beside providers.json,
@@ -70,14 +72,18 @@ func StoreIcon(data []byte) (string, error) {
 // user confirms the import, never at parse time; the URL is re-checked here
 // so a crafted request can't point magpie at anything but a public https
 // picture, and the read stops one byte past MaxIcon so a huge body is
-// refused rather than buffered.
+// refused rather than buffered. The picture is asked for through
+// usemagpie.ai's icon proxy, so its host never sees the user's IP.
 func FetchIcon(ctx context.Context, rawURL string) (string, error) {
 	u, err := iconURL(rawURL)
 	if err != nil {
 		return "", err
 	}
-	return fetchIcon(ctx, guardClient(), u)
+	return fetchIcon(ctx, iconClient(), iconproxy.URL(u))
 }
+
+// iconClient is the client FetchIcon uses; tests point it at a local proxy.
+var iconClient = guardClient
 
 // guardClient is the http.Client icon fetches use: the default transport —
 // so the proxy settings still apply — but with dialing wrapped in publicDial.
@@ -309,14 +315,18 @@ func iconExt(b []byte) string {
 	return ""
 }
 
-// pruneIcons removes pictures no provider points at any more. One picked in
-// the editor is stored before its provider is saved, so a fresh one stays.
+// pruneIcons removes pictures no provider points at any more, nor a plugin
+// gave its provider (PluginIcon). One picked in the editor is stored
+// before its provider is saved, so a fresh one stays.
 func pruneIcons(f file) {
 	used := map[string]bool{}
 	for _, p := range f.Providers {
 		if name, ok := strings.CutPrefix(p.Icon, iconPrefix); ok {
 			used[name] = true
 		}
+	}
+	for _, name := range keptPluginIcons() {
+		used[name] = true
 	}
 	ents, _ := os.ReadDir(IconDir())
 	for _, e := range ents {

@@ -2,13 +2,14 @@
 // The "Provider in model names" setting (#335: 希望 Codex 模型列表里的显示名可以
 // 不带 · routing group / · 提供商 后缀): on by default; Off posts
 // settings/plain-names on its own (so the agents' lists are written again)
-// and lights Off, On posts it back, and neither click scrolls the Settings
-// page. English and Chinese, Chromium and WebKit; no backend, the API is faked here.
+// with mode off and lights Off, On posts it back, and neither click scrolls
+// the Settings page. English and Chinese, Chromium and WebKit; no backend, the API is faked here.
 const assert = require("node:assert/strict");
 const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
+const { watchSettingsReads, settingsDrawn } = require("./reader.cjs");
 
 const assets = path.resolve(__dirname, "../assets");
 
@@ -37,7 +38,7 @@ function server(lang, posted) {
     if (url.pathname === "/api/settings/plain-names") {
       const body = req.postDataJSON();
       posted.push(["plain-names", body]);
-      cur = { ...cur, plainNames: body.on };
+      cur = { ...cur, plainNames: body.mode === "off", plainOwnNames: body.mode === "own" };
       return json(cur);
     }
     if (url.pathname === "/api/settings") {
@@ -59,8 +60,8 @@ function server(lang, posted) {
 }
 
 const want = {
-  en: { name: "Provider in model names", sub: /routing group/, off: "Off", on: "On" },
-  zh: { name: "模型名带提供商", sub: /除非有两个会重名/, off: "关闭", on: "开启" },
+  en: { name: "Provider in model names", sub: /provider after its name/, off: "Off", own: "Not on names I set", on: "On" },
+  zh: { name: "模型名带供应商", sub: /可设为自定义名称不带/, off: "关闭", own: "自定义名称不带供应商", on: "开启" },
 };
 const view = (page) => page.locator("#view-settings").evaluate((v) => v.scrollTop);
 
@@ -81,14 +82,16 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         }
         await browser.close();
       });
+      await watchSettingsReads(page);
       await page.goto("http://magpie.test/?view=settings");
+      await settingsDrawn(page); // rows found are the ones that stay (#1659)
       const segs = page.locator("#plainNamesSegs .opt");
       await segs.first().waitFor();
       const row = page.locator(".row.pref", { has: page.locator("#plainNamesSegs") });
       assert.equal((await row.locator(".name").textContent()).trim(), want[lang].name);
       assert.match(await row.locator(".sub").textContent(), want[lang].sub);
-      assert.deepEqual((await segs.allTextContents()).map((s) => s.trim()), [want[lang].off, want[lang].on]);
-      assert.equal(await segs.nth(1).evaluate((b) => b.classList.contains("on")), true, "on by default");
+      assert.deepEqual((await segs.allTextContents()).map((s) => s.trim()), [want[lang].off, want[lang].own, want[lang].on]);
+      assert.equal(await segs.nth(2).evaluate((b) => b.classList.contains("on")), true, "on by default");
 
       // scrolled by a wheel till the row is mid-view (a real wheel, so the
       // reader's-scroll guard lets it stick), Off moves nothing and is
@@ -103,12 +106,12 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await page.locator("#plainNamesSegs .opt.on", { hasText: want[lang].off }).waitFor();
       await page.waitForTimeout(400);
       assert.equal(await view(page), before, "the click scrolled the page");
-      assert.deepEqual(posted, [["plain-names", { on: true }]]);
+      assert.deepEqual(posted, [["plain-names", { mode: "off" }]]);
 
       // back on
-      await page.locator("#plainNamesSegs .opt", { hasText: want[lang].on }).click();
+      await segs.nth(2).click();
       await page.locator("#plainNamesSegs .opt.on", { hasText: want[lang].on }).waitFor();
-      assert.deepEqual(posted.at(-1), ["plain-names", { on: false }]);
+      assert.deepEqual(posted.at(-1), ["plain-names", { mode: "on" }]);
       assert.equal(await view(page), before, "the click scrolled the page");
       assert.deepEqual(errors, []);
     });

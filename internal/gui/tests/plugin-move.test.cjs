@@ -46,9 +46,11 @@ function serve(lang, posts) {
     if (url.pathname === "/api/state") return json({ agents: [], profiles: [], settings: { lang, theme: "light" } });
     if (url.pathname === "/api/providers") return json(payload());
     if (url.pathname === "/api/groups") return json({ groups: [] });
-    if (url.pathname === "/api/plugins/market") {
-      return json({ listings: [{ package: pkg, name: "Zed", icon: "zed", providers: ["zed"], community: true, replaces: "zed", summary: { en: "Zed", zh: "Zed" }, npm: { version: "0.1.0" } }],
+    // the page asks for the market in parts (#488)
+    if (url.pathname === "/api/plugins/market" || url.pathname === "/api/plugins" || url.pathname === "/api/plugins/listings") {
+      const m = ({ listings: [{ package: pkg, name: "Zed", icon: "zed", providers: ["zed"], community: true, replaces: "zed", summary: { en: "Zed", zh: "Zed" }, npm: { version: "0.1.0" } }],
         state: { bun: true, bunVersion: "1.3.0", plugins: [], movable: move.state === "plugin" ? [] : [{ id: "zed", name: "Zed", package: pkg, accounts: 2 }] } });
+      return json(url.pathname === "/api/plugins" ? m.state : url.pathname === "/api/plugins/listings" ? { listings: m.listings } : m);
     }
     if (url.pathname === "/api/provider/move" || url.pathname === "/api/provider/moveback") {
       posts.push({ path: url.pathname, body: route.request().postDataJSON() });
@@ -69,16 +71,16 @@ function serve(lang, posts) {
 }
 
 const L = {
-  en: { runs: "Runs on", line: "Zed can run on community plugins, with the same accounts.", look: "Take a look",
+  en: { runs: "Runs on", line: "Zed's built-in subscription is deprecated", look: "Review the move",
     move: "Move to the plugin", busy: "Installing the plugin and checking each account…", again: "Try again", back: "Use the built-in again",
     failed: "It stays built-in: magpie couldn't reach npm to install the plugin. Check the network or proxy, then try again.",
     onPlugin: "The community Zed plugin", builtin: "magpie's built-in · or the community Zed plugin", done: "Zed now runs on its plugin — 2 accounts, 1 model.",
-    subs: "Subscriptions", card: "Move my Zed accounts (2)", own: "Zed itself stays signed in as it is." },
-  zh: { runs: "运行方式", line: "Zed 可以改由社区插件运行，账号不变。", look: "看看",
+    subs: "Subscriptions", card: "Move", own: "Zed itself stays signed in as it is." },
+  zh: { runs: "运行方式", line: "Zed 的内置订阅已弃用", look: "查看迁移",
     move: "迁移到插件", busy: "正在安装插件并逐个检查账号…", again: "重试", back: "改回内置",
     failed: "仍使用内置：无法连接 npm 安装插件，请检查网络或代理后重试。",
-    onPlugin: "社区 Zed 插件", builtin: "magpie 内置 · 也可改用社区 Zed 插件", done: "Zed 现在由插件运行——2 个账号，1 个模型。",
-    subs: "订阅", card: "迁移我的 Zed 账号（2）", own: "Zed 本身的登录保持不变。" },
+    onPlugin: "社区 Zed 插件", builtin: "magpie 内置 · 也可改用社区 Zed 插件", done: "Zed 已改由插件运行：2 个账号，1 个模型。",
+    subs: "订阅", card: "迁移", own: "Zed 本身的登录不变。" },
 };
 
 const launch = (engine) => engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" });
@@ -96,10 +98,10 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await page.route("**/*", serve(lang, posts));
       await page.goto("http://magpie.test/?view=providers");
 
-      // the quiet line over the list opens Zed's editor
+      // the deprecation notice over the list opens Zed's editor
       const line = page.locator("#movable");
       await line.locator("button", { hasText: w.look }).waitFor();
-      assert.ok((await line.innerText()).includes(w.line), "no line saying Zed can move");
+      assert.ok((await line.innerText()).includes(w.line), "no notice saying Zed is deprecated");
       await line.locator("button", { hasText: w.look }).click();
 
       const ed = page.locator("#modal .editor");
@@ -114,12 +116,29 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert.ok(!text.includes(pkg), "names the npm package in the sentence");
       assert.ok(text.includes(w.own), "doesn't say Zed stays signed in");
 
-      // the reader scrolled to the field: nothing the move does moves it
-      const body = ed.locator(".ebody");
-      const top = await body.evaluate((e) => { e.scrollTop = 120; return e.scrollTop; });
+      // the reader scrolled to the field: nothing the move does moves it.
+      // A wheel, as a reader's scroll (a script's scrollTop is put back), and
+      // only so far that the button stays in sight: a click on a button out
+      // of sight is Playwright's own scroll first, not the reader's
+      const body = ed.locator(".ebody"), box = await body.boundingBox();
+      const at = () => body.evaluate((e) => e.scrollTop);
+      await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+      for (let i = 0; i < 20 && (await btn.boundingBox()).y > box.y + 40; i++) {
+        const was = await at();
+        await page.mouse.wheel(0, 30);
+        await page.waitForTimeout(80);
+        if (await at() === was) break;
+      }
+      const top = await at();
       assert.ok(top > 0, "the editor doesn't scroll: the test proves nothing about keeping its place");
+      // a press where the button is, as the reader's mouse does
+      const press = async () => {
+        const b = await btn.boundingBox();
+        assert.ok(b.y >= box.y && b.y + b.height <= box.y + box.height, "the button is out of sight");
+        await page.mouse.click(b.x + b.width / 2, b.y + b.height / 2);
+      };
 
-      await btn.click();
+      await press();
       await page.waitForFunction((busy) => [...document.querySelectorAll("#modal .move button")].some((b) => b.textContent === busy), w.busy, { timeout: 300 });
       assert.equal(await btn.isDisabled(), true, "the button can be pressed again mid-move");
 
@@ -133,7 +152,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       if (process.env.ARTIFACT_DIR) await ed.screenshot({ path: path.join(process.env.ARTIFACT_DIR, `plugin-move-failed-${engine}-${lang}.png`) });
 
       // tried again, it goes through: the same editor, turned over
-      await btn.click();
+      await press();
       const back = ed.locator(".move button", { hasText: w.back });
       await back.waitFor();
       assert.equal(await page.locator("#modal .editor").count(), 1, "the editor closed");

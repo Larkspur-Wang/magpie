@@ -6,10 +6,12 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
 
+	"github.com/yetone/magpie/internal/filememo"
 	"github.com/yetone/magpie/internal/redact"
 )
 
@@ -55,8 +57,8 @@ func TestRoundTrip(t *testing.T) {
 	if Save(Settings{SessionTerminal: "Ghostty; rm -rf /"}) == nil {
 		t.Fatal("bad terminal app id accepted")
 	}
-	// the text size is 100% until one of the sizes is chosen
-	if Save(Settings{}) != nil || Load().TextSize != 100 {
+	// the text size is the system's default until one of the sizes is chosen
+	if Save(Settings{}) != nil || Load().TextSize != DefaultTextSize() {
 		t.Fatalf("default text size: %+v", Load())
 	}
 	if Save(Settings{TextSize: 125}) != nil || Load().TextSize != 125 {
@@ -139,7 +141,7 @@ func TestMigrate(t *testing.T) {
 	}
 	Migrate()
 	fi, err := os.Stat(filepath.Join(cfg, "magpie", "providers.json"))
-	if err != nil || fi.Mode().Perm() != 0o600 {
+	if err != nil || runtime.GOOS != "windows" && fi.Mode().Perm() != 0o600 { // Windows has no such bits
 		t.Fatalf("providers.json not copied with its mode: %v %v", fi, err)
 	}
 	if _, err := os.Stat(filepath.Join(cfg, "magpie", "sub", "x")); err != nil {
@@ -484,18 +486,53 @@ func TestModelPriceKeysStayTheFilesOwnWhileMessagesSayTheParts(t *testing.T) {
 	}
 }
 
-// the usage alerts' share and amount (#368): 0 is off, the rest in range
+// the usage alerts' share and amount (#368), and a turn's length before
+// its end is said: 0 is off, the rest in range
 func TestAlertsChecked(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-	for _, s := range []Settings{{UsageAlert: 101}, {UsageAlert: -1}, {BalanceAlert: -0.5}} {
+	for _, s := range []Settings{{UsageAlert: 101}, {UsageAlert: -1}, {BalanceAlert: -0.5}, {TurnDoneAlert: -1}, {TurnDoneAlert: 86401}} {
 		if err := Save(s); err == nil {
 			t.Errorf("saved %+v", s)
 		}
 	}
-	if err := Save(Settings{UsageAlert: 80, BalanceAlert: 2.5}); err != nil {
+	if err := Save(Settings{UsageAlert: 80, BalanceAlert: 2.5, TurnDoneAlert: 180}); err != nil {
 		t.Fatal(err)
 	}
-	if s := Load(); s.UsageAlert != 80 || s.BalanceAlert != 2.5 {
-		t.Fatalf("read back %d %v", s.UsageAlert, s.BalanceAlert)
+	if s := Load(); s.UsageAlert != 80 || s.BalanceAlert != 2.5 || s.TurnDoneAlert != 180 {
+		t.Fatalf("read back %d %v %d", s.UsageAlert, s.BalanceAlert, s.TurnDoneAlert)
+	}
+}
+
+// Windows and Linux start at 110% (#914), the Mac at 100%; a size saved
+// before, 100% too, is kept on any of them.
+func TestDefaultTextSize(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	orig := DefaultTextSize
+	t.Cleanup(func() { DefaultTextSize = orig })
+	for _, c := range []struct {
+		goos string
+		want int
+	}{{"windows", 110}, {"linux", 110}, {"darwin", 100}} {
+		DefaultTextSize = func() int { return c.want }
+		if err := os.Remove(Path()); err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		filememo.Forget()
+		if got := Load().TextSize; got != c.want {
+			t.Fatalf("%s, nothing saved: text size %d, want %d", c.goos, got, c.want)
+		}
+		if err := Save(Settings{TextSize: 100}); err != nil {
+			t.Fatal(err)
+		}
+		if got := Load().TextSize; got != 100 {
+			t.Fatalf("%s: a saved 100%% became %d", c.goos, got)
+		}
+	}
+	want := 100
+	if runtime.GOOS == "windows" || runtime.GOOS == "linux" {
+		want = 110
+	}
+	if orig() != want {
+		t.Fatalf("on %s the default is %d, want %d", runtime.GOOS, orig(), want)
 	}
 }

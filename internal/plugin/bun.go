@@ -19,11 +19,35 @@ import (
 	"sync"
 
 	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/netproxy"
+	"github.com/yetone/magpie/internal/source"
 )
 
-// BunVersion is the Bun magpie downloads to run plugins with, the first
-// time one is needed.
-const BunVersion = "1.3.14"
+// BunVersion is the Bun magpie downloads to run plugins with the first
+// time one is needed, and the oldest it runs them on: newer releases are
+// taken as they come (see CheckBun). Update bunSums below, testenv.MinBun
+// and test.yml's bun-version when it changes.
+const BunVersion = "1.4.2"
+
+// bunSums are the SHA-256s of BunVersion's builds, from Bun's own
+// SHASUMS256.txt. They let the default Bun be downloaded through a mirror
+// when Bun's GitHub release page can't be reached.
+var bunSums = map[string]string{
+	"bun-darwin-aarch64.zip":             "90987a3a16d7db556d886ac3d551e7b6d3edf0a1cf43acaed622e8676be1d12f",
+	"bun-darwin-x64.zip":                 "80520d7e17526308c9185d261679ac6d27798d3803a0e9f7ff9121ab8affb012",
+	"bun-linux-aarch64.zip":              "54328bbc2d9c8e0c9f892c544d66c57a83b84139e34909e5ee81758f1ac8fda7",
+	"bun-linux-x64-baseline.zip":         "c678040f14fe0440eb839d37cbd0ce4c051a32da72806ac97de6a6aab6bf728f",
+	"bun-windows-x64-baseline.zip":       "78c221c2376f79731ccf4e4af0b3bb46d81fefa3296c5abee09ad8a1b21e68c6",
+	"bun-linux-aarch64-android.zip":      "a1c7e2983f1bb65146beb256a4d72449f23042412bc2cf278aa6397ba27e0274",
+	"bun-linux-x64-android-baseline.zip": "fe36d8d4795e0eadc22fb6696d44d168491c2e5b9b7cbb12b8c96b0c0c40a4f9",
+}
+
+func bunChecksum(version, target string) string {
+	if version != BunVersion {
+		return ""
+	}
+	return bunSums[target+".zip"]
+}
 
 // bunRelease is where Bun's releases are; a var for tests.
 var bunRelease = "https://github.com/oven-sh/bun/releases/download"
@@ -40,6 +64,12 @@ func bunTarget() (string, error) {
 	}
 	switch runtime.GOOS {
 	case "darwin", "linux":
+	case "android":
+		t := "bun-linux-" + arch + "-android"
+		if arch == "x64" {
+			t += "-baseline"
+		}
+		return t, nil
 	case "windows":
 		if arch != "x64" {
 			return "", fmt.Errorf("Bun has no build for windows/%s", runtime.GOARCH)
@@ -54,11 +84,6 @@ func bunTarget() (string, error) {
 	return t, nil
 }
 
-// bunDir is where the downloaded Bun is kept.
-func bunDir() string {
-	return filepath.Join(filepath.Dir(catalog.CachePath()), "bun", BunVersion)
-}
-
 func bunExe() string {
 	if runtime.GOOS == "windows" {
 		return "bun.exe"
@@ -67,19 +92,21 @@ func bunExe() string {
 }
 
 // Bun is the bun to run plugins with: $MAGPIE_BUN when set, else the one
-// magpie downloaded, downloading it now when there is none yet.
+// magpie downloaded and keeps up to date, downloading it now when there
+// is none yet.
 func Bun(ctx context.Context) (string, error) {
 	if b := os.Getenv("MAGPIE_BUN"); b != "" {
 		return b, nil
 	}
 	bunMu.Lock()
 	defer bunMu.Unlock()
-	exe := filepath.Join(bunDir(), bunExe())
-	if _, err := os.Stat(exe); err == nil {
+	v := inUseLocked()
+	exe := bunExeOf(v)
+	if haveBun(v) {
 		return exe, nil
 	}
-	if err := downloadBun(ctx, exe); err != nil {
-		return "", fmt.Errorf("downloading Bun %s to run plugins: %w", BunVersion, err)
+	if err := downloadBun(ctx, v, exe); err != nil {
+		return "", fmt.Errorf("downloading Bun %s to run plugins: %w", v, err)
 	}
 	return exe, nil
 }
@@ -89,30 +116,33 @@ func HasBun() bool {
 	if os.Getenv("MAGPIE_BUN") != "" {
 		return true
 	}
-	_, err := os.Stat(filepath.Join(bunDir(), bunExe()))
-	return err == nil
+	bunMu.Lock()
+	defer bunMu.Unlock()
+	return haveBun(inUseLocked())
 }
 
-func downloadBun(ctx context.Context, exe string) error {
+func downloadBun(ctx context.Context, version, exe string) error {
 	target, err := bunTarget()
 	if err != nil {
 		return err
 	}
-	base := bunRelease + "/bun-v" + BunVersion + "/"
-	sums, err := getURL(ctx, base+"SHASUMS256.txt", 1<<20)
-	if err != nil {
-		return err
-	}
-	want := ""
-	sc := bufio.NewScanner(strings.NewReader(string(sums)))
-	for sc.Scan() {
-		f := strings.Fields(sc.Text())
-		if len(f) == 2 && f[1] == target+".zip" {
-			want = f[0]
-		}
-	}
+	base := bunRelease + "/bun-v" + version + "/"
+	want := bunChecksum(version, target)
 	if want == "" {
-		return fmt.Errorf("%s.zip isn't in the release's checksums", target)
+		sums, err := getURLOfficial(ctx, base+"SHASUMS256.txt", 1<<20)
+		if err != nil {
+			return err
+		}
+		sc := bufio.NewScanner(strings.NewReader(string(sums)))
+		for sc.Scan() {
+			f := strings.Fields(sc.Text())
+			if len(f) == 2 && f[1] == target+".zip" {
+				want = f[0]
+			}
+		}
+		if want == "" {
+			return fmt.Errorf("%s.zip isn't in the release's checksums", target)
+		}
 	}
 	z, err := getURL(ctx, base+target+".zip", 200<<20)
 	if err != nil {
@@ -157,11 +187,24 @@ func downloadBun(ctx context.Context, exe string) error {
 }
 
 func getURL(ctx context.Context, url string, limit int64) ([]byte, error) {
+	return getURLFrom(ctx, url, limit, true)
+}
+
+func getURLOfficial(ctx context.Context, url string, limit int64) ([]byte, error) {
+	return getURLFrom(ctx, url, limit, false)
+}
+
+func getURLFrom(ctx context.Context, url string, limit int64, mirror bool) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
-	res, err := http.DefaultClient.Do(req)
+	var res *http.Response
+	if mirror {
+		res, err = source.Do(http.DefaultClient, req)
+	} else {
+		res, err = source.DoOfficial(http.DefaultClient, req)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -180,10 +223,30 @@ func getURL(ctx context.Context, url string, limit int64) ([]byte, error) {
 }
 
 // bunCommand runs bun with args in dir, the environment's proxy settings
-// passed on.
+// passed on (a SOCKS5 one bridged, as Bun can't use it: #1409), the roots
+// the system trusts added to Bun's (caEnv), and npm's registry in China
+// with the 「国内镜像」 switch on (its packages are npm's own, checked
+// against the integrity npm gave).
 var bunCommand = func(ctx context.Context, bun, dir string, args ...string) *exec.Cmd {
 	cmd := command(ctx, bun, args...)
 	cmd.Dir = dir
-	cmd.Env = append(env(), "BUN_INSTALL_CACHE_DIR="+filepath.Join(filepath.Dir(catalog.CachePath()), "bun", "install-cache"))
+	cmd.Env = append(netproxy.EnvForBun(env()), "BUN_INSTALL_CACHE_DIR="+filepath.Join(filepath.Dir(catalog.CachePath()), "bun", "install-cache"))
+	cmd.Env = append(cmd.Env, caEnv(cmd.Env, dir)...)
+	cmd.Env = append(cmd.Env, registryEnv(cmd.Env)...)
 	return cmd
+}
+
+// registryEnv is what has bun install from npm's registry in China, with
+// the switch on, unless the environment names a registry already.
+func registryEnv(env []string) []string {
+	if !source.China() {
+		return nil
+	}
+	for _, kv := range env {
+		k, v, _ := strings.Cut(kv, "=")
+		if k = strings.ToUpper(k); (k == "BUN_CONFIG_REGISTRY" || k == "NPM_CONFIG_REGISTRY") && strings.TrimSpace(v) != "" {
+			return nil
+		}
+	}
+	return []string{"BUN_CONFIG_REGISTRY=" + source.NPMMirror + "/"}
 }

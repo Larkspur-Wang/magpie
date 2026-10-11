@@ -1,5 +1,14 @@
 package gateway
 
+// PLUGIN-SERVED (see AGENTS.md): Zed ("zed") is a deprecated built-in
+// subscription served by its plugin, @magpie-community/opencode-zed-auth,
+// once moved onto it (provider.Moved; the default for a new sign-in). A
+// moved one's sign-ins, models, requests and usage are all the plugin's,
+// never this code's (only the move, in migrate*.go, still reads its
+// accounts). A fix here alone doesn't reach those users; fix the plugin
+// (github.com/magpie-community/plugins, packages/zed) and raise the mover's
+// min in internal/provider/migrate_zed.go.
+
 import (
 	"bytes"
 	"context"
@@ -36,10 +45,12 @@ func (s *Server) serveZed(w http.ResponseWriter, r *http.Request, from provider.
 	if err != nil {
 		return writeError(w, from, 400, err.Error()), err.Error()
 	}
+	// the vendor's own API is told the answer's format in words
+	req = req.inSystem()
 	req.Model = model
 	ask := s.askZed(p.Account.User, model)
 	if req.WebSearch && !searching(r.Context()) {
-		if _, _, ok := searcher(); ok {
+		if canSearch() {
 			return s.searchReply(w, r, from, "Zed", req, usage, ask)
 		}
 	}
@@ -77,7 +88,10 @@ func zedRequest(req *Request, vendor, model string) (json.RawMessage, provider.P
 		b, err := json.Marshal(m)
 		return b, provider.Anthropic, err
 	case "responses":
-		return buildResponses(&q, model, "api.openai.com", false), provider.Responses, nil
+		// fitted to the Responses types Zed's cloud reads (a web_search
+		// tool, or include's web_search_call.action.sources, would have it
+		// turn the request away)
+		return provider.ZedBody(buildResponses(&q, model, "api.openai.com", false)), provider.Responses, nil
 	case "chat":
 		var m map[string]json.RawMessage
 		if err := json.Unmarshal(buildChat(&q, model, "api.x.ai", false), &m); err != nil {
@@ -167,6 +181,7 @@ func (s *Server) askZed(user, model string) round {
 			}
 			break
 		}
+		res = notAnAPIReply(res, "") // a web page served 200 (#1012)
 		if res.StatusCode/100 != 2 {
 			b, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
 			res.Body.Close()

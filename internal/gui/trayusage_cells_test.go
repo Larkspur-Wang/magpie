@@ -2,6 +2,7 @@ package gui
 
 import (
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -29,14 +30,14 @@ func TestTrayUsageCells(t *testing.T) {
 	cards := trayCards()
 
 	// the ticked ones in the order ticked; one no longer there is left out
-	picked := trayPick(cards, []string{"codex|x@y.z", "gone|who", "claude|a@b.c"})
+	picked := trayPick(cards, []string{"codex|x@y.z", "gone|who", "claude|a@b.c"}, time.Now())
 	if len(picked) != 2 || picked[0].Provider != "codex" || picked[1].Provider != "claude" {
 		t.Fatalf("picked %+v", picked)
 	}
-	if got := trayPick(cards, nil); got != nil {
+	if got := trayPick(cards, nil, time.Now()); got != nil {
 		t.Fatalf("none ticked: %+v", got)
 	}
-	if got := trayPick(cards, []string{"claude"}); got != nil {
+	if got := trayPick(cards, []string{"claude"}, time.Now()); got != nil {
 		t.Fatalf("the vendor without the account: %+v", got)
 	}
 
@@ -51,7 +52,7 @@ func TestTrayUsageCells(t *testing.T) {
 		{[]string{"claude|a@b.c", "codex|x@y.z", "copilot", "deepseek"},
 			[][]string{{"42%", "18%"}, {"8%", "100%"}, {"63%"}, {"¥12.30"}}, "42% · 18% | 8% · 100% | 63% | ¥12.30"},
 	} {
-		cells, label, tip := trayUsageView(trayPick(cards, tc.ids), now, false)
+		cells, label, tip := trayUsageView(trayPick(cards, tc.ids, now), now, false)
 		if label != tc.label {
 			t.Errorf("%v: label %q, want %q", tc.ids, label, tc.label)
 		}
@@ -111,6 +112,31 @@ func TestTrayUsageCells(t *testing.T) {
 	}
 	if cells, label, tip := trayUsageView(odd[:2], now, false); cells != nil || label != "" || tip != "Codex: signed out" {
 		t.Errorf("nothing to draw: %+v %q %q", cells, label, tip)
+	}
+}
+
+// Every rendered cell carries its own identity, even with logos disabled
+// or unreadable cards skipped. JavaScript arguments preserve unusual account IDs.
+func TestTrayCellsCards(t *testing.T) {
+	cards := trayCards()
+	cards[0].User = "a\"b\\c@例子.test"
+	cards[1].Error = "signed out"
+	cells, _, _ := trayUsageView(cards, time.Now(), false)
+	plain := trayPlain(cells)
+	if len(cells) != len(cards)-1 {
+		t.Fatalf("cells: %d", len(cells))
+	}
+	for i, cell := range cells {
+		at := i
+		if i > 0 {
+			at++
+		}
+		if cell.ID != trayCardID(cards[at]) || plain[i].ID != cell.ID {
+			t.Fatalf("cell %d: %q, plain %q", i, cell.ID, plain[i].ID)
+		}
+		if got := panelQuotaJS(cell.ID); got != "panelQuotaFocus("+strconv.Quote(cell.ID)+")" {
+			t.Fatalf("JS: %s", got)
+		}
 	}
 }
 

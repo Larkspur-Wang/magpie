@@ -29,13 +29,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/edit"
-	"github.com/yetone/magpie/internal/gateway"
 )
 
 // openChamberDir is where OpenChamber keeps its settings.
 func openChamberDir(home string) string {
-	if d := os.Getenv("OPENCHAMBER_DATA_DIR"); d != "" {
+	if d := appdir.Getenv("OPENCHAMBER_DATA_DIR"); d != "" {
 		if abs, err := filepath.Abs(d); err == nil {
 			return abs
 		}
@@ -164,7 +164,7 @@ func openChamber(home, cfg string) *Agent {
 	oc := opencode(home, cfg)
 	ocPath := oc.Path
 	auth := filepath.Join(home, ".local", "share", "opencode", "auth.json")
-	provider := func() any { return magpieProviderJSONFor("opencode", "opencode") }
+	provider := theirsKept(ocPath, "provider."+magpieID, func() any { return magpieProviderJSONFor("opencode", "opencode") }, "models")
 	opts := func(key string) func(map[string]string) []Option {
 		return func(cur map[string]string) []Option {
 			return append(ownOptions(auth, cur[key]), viaMagpie("opencode", magpieID+"/")...)
@@ -181,7 +181,7 @@ func openChamber(home, cfg string) *Agent {
 		return edit.DelJSON(ocPath, "provider."+magpieID)
 	}
 	return &Agent{
-		ID: "openchamber", Name: "OpenChamber", Icon: "openchamber", Aliases: []string{"chamber"},
+		ID: "openchamber", Name: "OpenChamber", Icon: "openchamber", Aliases: []string{"chamber"}, Spelled: openCodeSpelled(ocPath, gatewayV1),
 		// its model requests are its OpenCode's, and counted as OpenCode's
 		Bin: "openchamber", Dir: s.dir, Path: s.prefs(),
 		Notice: func() string {
@@ -190,12 +190,12 @@ func openChamber(home, cfg string) *Agent {
 				ps := s.projectModels()
 				for _, name := range slices.Sorted(maps.Keys(ps)) {
 					if m := ps[name]; !usesMagpie(m) {
-						notes = append(notes, fmt.Sprintf("OpenChamber's project %s has a default model of its own (%s), which it uses there instead.", name, m))
+						notes = append(notes, noticeOpenchamber1.say("project", name, "model", m))
 					}
 				}
 			}
 			if Running(`OpenChamber\.app/`, `(^|/)openchamber( |$)`) {
-				notes = append(notes, "OpenChamber takes the new model for new sessions; sessions already open keep theirs.")
+				notes = append(notes, noticeOpenchamber2.String())
 			}
 			return strings.Join(notes, " ")
 		},
@@ -204,13 +204,13 @@ func openChamber(home, cfg string) *Agent {
 				return ""
 			}
 			return wiringOff("OpenChamber", ocPath, func(k string) (string, bool) { return edit.GetJSON(ocPath, "provider."+magpieID+".options."+k) },
-				"baseURL", gatewayV1(), "apiKey", gateway.Token)
+				"baseURL", gatewayV1(), "apiKey", hereKey())
 		},
 		Sync: func() error {
 			if _, ok := edit.GetJSON(ocPath, "provider."+magpieID); !ok && usesMagpie(s.model(), s.small()) {
 				return edit.SetJSON(ocPath, edit.KV{Path: "provider." + magpieID, Value: provider()})
 			}
-			return syncJSON(ocPath, "provider."+magpieID, provider)
+			return syncJSONInOrder(ocPath, "provider."+magpieID, provider)
 		},
 		Fields: []Field{
 			{Key: "model", Label: "model", Get: s.model, Options: opts("model"), Set: func(v string) error {
@@ -248,3 +248,9 @@ func openChamber(home, cfg string) *Agent {
 		},
 	}
 }
+
+// what openchamber says after a change (notice.go)
+var (
+	noticeOpenchamber1 = newNotice("OpenChamber's project {project} has a default model of its own ({model}), which it uses there instead.")
+	noticeOpenchamber2 = newNotice("OpenChamber takes the new model for new sessions; sessions already open keep theirs.")
+)

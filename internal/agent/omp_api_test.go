@@ -15,10 +15,14 @@ import (
 // omp asks each model on the API its provider serves it on, as Pi does: a
 // Claude over Chat lost its thinking's signatures between tool turns. A
 // Messages-only provider's models go on anthropic-messages at the gateway,
-// a Responses-only one's on openai-responses, and a Chat provider's and a
-// group's stay on the provider's openai-completions, keyless.
+// a Responses-only one's on openai-responses, and a Chat provider's stay on
+// the provider's openai-completions, keyless. A group goes on
+// openai-responses when all its members are best there (#1594), else stays.
 func TestOmpModelsAskedOnTheirNativeAPI(t *testing.T) {
 	home := syncHome(t)
+	was := ompVersion
+	ompVersion = func() string { return "16.3.5" }
+	t.Cleanup(func() { ompVersion = was })
 	for _, p := range []provider.Provider{
 		{ID: "resp", Name: "Resp", Key: "k", Responses: "http://127.0.0.1:1/v1", Models: []string{"grok-5", "gpt-5.5"}},
 		{ID: "openai", Name: "OpenAI", Key: "k", Chat: "https://api.openai.com/v1", Responses: "https://api.openai.com/v1", Models: []string{"gpt-5.5"}},
@@ -27,6 +31,9 @@ func TestOmpModelsAskedOnTheirNativeAPI(t *testing.T) {
 		if err := provider.Save(p); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if err := provider.SaveGroup(provider.Group{ID: "mixed", Name: "Mixed", Members: []string{"resp/grok-5", "relay/glm-4.6"}}); err != nil {
+		t.Fatal(err)
 	}
 	var live []catalog.Model
 	for _, id := range []string{"claude-sonnet-5", "claude-sonnet-4-5", "kimi-k3"} {
@@ -61,7 +68,8 @@ func TestOmpModelsAskedOnTheirNativeAPI(t *testing.T) {
 		"anth/claude-sonnet-5":   "anthropic-messages",
 		"anth/claude-sonnet-4-5": "anthropic-messages",
 		"anth/kimi-k3":           "anthropic-messages",
-		"group/auto-gpt-5-5":     nil,
+		"group/auto-gpt-5-5":     "openai-responses",
+		"group/mixed":            nil,
 	} {
 		e, ok := entries[id]
 		if !ok {
@@ -77,8 +85,8 @@ func TestOmpModelsAskedOnTheirNativeAPI(t *testing.T) {
 		if e["baseUrl"] != gateway.URL() {
 			t.Errorf("%s: baseUrl %v, want %s", id, e["baseUrl"], gateway.URL())
 		}
-		// and its efforts stop at xhigh, the gateway's way to max: omp
-		// 16.3.5 turns the whole models.yml away over a max
+		// and, for omp 16.3.5, its efforts stop at xhigh, the gateway's way
+		// to max: it turns the whole models.yml away over a max
 		th, _ := e["thinking"].(map[string]any)
 		if th["mode"] != mode || fmt.Sprint(th["efforts"]) != "[low high xhigh]" {
 			t.Errorf("%s: thinking %v, want mode %s, efforts [low high xhigh]", id, e["thinking"], mode)

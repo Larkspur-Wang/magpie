@@ -1,17 +1,22 @@
 package provider
 
 // A plan bought with an API key — Zhipu's GLM Coding Plan (and Z.ai's),
-// Kimi Code, OpenCode Go, a Command Code plan and StepFun's Step Plan —
-// has windows of allowance like a subscription's, which the vendor tells
-// to the key (StepFun only to a sign-in, stepfun_plan.go): the Usage page
-// shows them beside the subscriptions'.
+// Kimi Code, OpenCode Go, a Command Code plan, MiniMax's Coding (Token)
+// Plan, StepFun's Step Plan, Volcengine Ark's Coding and Agent Plans and
+// Tencent Cloud's Token Plan 企业版 — has windows of allowance like a
+// subscription's, which the vendor tells to the key (StepFun only to a
+// sign-in, stepfun_plan.go; Volcengine and Tencent Cloud only to the
+// account's access key, volcengine_usage.go and tencent_usage.go): the
+// Usage page shows them beside the subscriptions'.
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -46,6 +51,10 @@ func planQuotaSourceOf(p Provider) (planQuotaSource, bool) {
 			// preset too, and is told the plan's 5-hour and weekly windows;
 			// a pay-as-you-go key has none, and no card
 			return planQuotaSource{"https://api.commandcode.ai/alpha/billing/credits", true, readCommandCodePlan, false}, true
+		case "api.minimaxi.com", "api.minimax.io":
+			// a Coding Plan key (sk-cp-…) is told its windows; a
+			// pay-as-you-go key isn't, and gets no card (#387)
+			return planQuotaSource{"https://" + hostOf(base) + "/v1/token_plan/remains", true, readMiniMaxPlan, false}, true
 		case "opencode.ai":
 			if u := strings.TrimSuffix(base, "/"); strings.HasSuffix(u, "/zen/go") || strings.Contains(u, "/zen/go/") {
 				return planQuotaSource{"https://opencode.ai/zen/go/v1/usage", true, readOpenCodeGo, true}, true
@@ -164,9 +173,188 @@ func readOpenCodeGo(b []byte) (string, []QuotaWindow, error) {
 		out = append(out, q)
 	}
 	if len(out) == 0 {
-		return "", nil, fmt.Errorf("no usage in the reply")
+		return "", nil, fmt.Errorf("OpenCode Go's reply has no rolling, weekly or monthly window: %s", shapeOf(b))
 	}
 	return "", out, nil
+}
+
+// shapeOf names the fields of a JSON reply magpie couldn't read, two
+// levels down, without their values: enough to see what the vendor sends
+// now, with nothing of the account in it.
+func shapeOf(b []byte) string {
+	var top map[string]json.RawMessage
+	if json.Unmarshal(b, &top) != nil {
+		if len(b) == 0 {
+			return "an empty reply"
+		}
+		return "a reply that isn't a JSON object"
+	}
+	var names []string
+	for k, v := range top {
+		var in map[string]json.RawMessage
+		if json.Unmarshal(v, &in) == nil && len(in) > 0 {
+			for k2 := range in {
+				names = append(names, k+"."+k2)
+			}
+			continue
+		}
+		names = append(names, k)
+	}
+	if len(names) == 0 {
+		return "an empty object"
+	}
+	slices.Sort(names)
+	if len(names) > 12 {
+		names = append(names[:12], "…")
+	}
+	return "fields " + strings.Join(names, ", ")
+}
+
+// readMiniMaxPlan reads MiniMax's /v1/token_plan/remains (#387):
+//
+//	{"model_remains":[{"model_name":"general",
+//	   "start_time":…,"end_time":…,"current_interval_remaining_percent":100,
+//	   "current_interval_status":1,"current_interval_total_count":0,
+//	   "weekly_start_time":…,"weekly_end_time":…,"current_weekly_remaining_percent":100,
+//	   "current_weekly_status":1,"current_weekly_total_count":0},
+//	  {"model_name":"video",…}],
+//	 "base_resp":{"status_code":0,"status_msg":"success"}}
+//
+// Each bucket is a quota with a rolling interval and a week, told as what
+// remains. "general" is what the models draw on; another (video, image…)
+// is metered apart and doesn't stop them. A bucket the plan doesn't have
+// comes as both windows unlimited (status 3) with no totals, and is left
+// out; status 2 is used up, whatever the percentage says. MiniMax answers
+// 200 to a key it refuses, with the reason in base_resp.
+//
+// A bucket counted in items (video's 5 a day, 35 a week) also tells
+// current_interval_usage_count and current_weekly_usage_count beside the
+// totals, and the window carries them as a count, as MiniMax's own CLI
+// (mmx quota show) shows "4 / 5" (#1366); see miniMaxCount.
+func readMiniMaxPlan(b []byte) (string, []QuotaWindow, error) {
+	type bucket struct {
+		Model      string   `json:"model_name"`
+		Start      int64    `json:"start_time"`
+		End        int64    `json:"end_time"`
+		Left       *float64 `json:"current_interval_remaining_percent"`
+		Status     int      `json:"current_interval_status"`
+		Total      *float64 `json:"current_interval_total_count"`
+		Count      *float64 `json:"current_interval_usage_count"`
+		WeekStart  int64    `json:"weekly_start_time"`
+		WeekEnd    int64    `json:"weekly_end_time"`
+		WeekLeft   *float64 `json:"current_weekly_remaining_percent"`
+		WeekStatus int      `json:"current_weekly_status"`
+		WeekTotal  *float64 `json:"current_weekly_total_count"`
+		WeekCount  *float64 `json:"current_weekly_usage_count"`
+	}
+	var r struct {
+		Remains []bucket `json:"model_remains"`
+		Base    *struct {
+			Code int    `json:"status_code"`
+			Msg  string `json:"status_msg"`
+		} `json:"base_resp"`
+	}
+	if err := json.Unmarshal(b, &r); err != nil {
+		return "", nil, err
+	}
+	if r.Base == nil {
+		return "", nil, fmt.Errorf("no plan in the reply")
+	}
+	if r.Base.Code != 0 {
+		if r.Base.Msg != "" {
+			return "", nil, fmt.Errorf("%s", r.Base.Msg)
+		}
+		return "", nil, fmt.Errorf("MiniMax said %d", r.Base.Code)
+	}
+	at := func(n int64) time.Time {
+		if n < 1e12 { // seconds
+			return time.Unix(n, 0)
+		}
+		return time.UnixMilli(n)
+	}
+	zero := func(f *float64) bool { return f != nil && *f == 0 }
+	out := []QuotaWindow{}
+	for _, k := range r.Remains {
+		name := strings.TrimSpace(k.Model)
+		if name == "" || k.Status == 3 && k.WeekStatus == 3 && zero(k.Total) && zero(k.WeekTotal) {
+			continue // not in the plan
+		}
+		general := strings.EqualFold(name, "general")
+		for _, x := range []struct {
+			left         *float64
+			status       int
+			start, end   int64
+			week         bool
+			count, total *float64
+		}{{k.Left, k.Status, k.Start, k.End, false, k.Count, k.Total}, {k.WeekLeft, k.WeekStatus, k.WeekStart, k.WeekEnd, true, k.WeekCount, k.WeekTotal}} {
+			if x.status == 3 || x.left == nil && x.status != 2 {
+				continue // unlimited, or nothing told
+			}
+			w := QuotaWindow{Used: 100}
+			if x.status != 2 {
+				w.Used = max(0, min(100, 100-*x.left))
+			}
+			if x.start > 0 && x.end > x.start {
+				w.Span = at(x.end).Sub(at(x.start))
+			} else if x.week {
+				w.Span = 7 * 24 * time.Hour
+			}
+			if x.end > 0 {
+				t := at(x.end)
+				w.ResetsAt = &t
+			}
+			switch span := w.Span; {
+			case x.week:
+				w.Name = "7 days"
+			case span > 24*time.Hour && span%(24*time.Hour) == 0:
+				w.Name = fmt.Sprintf("%d days", span/(24*time.Hour))
+			case span >= time.Hour && span%time.Hour == 0:
+				w.Name = fmt.Sprintf("%d hours", span/time.Hour)
+			case span > 0:
+				w.Name = fmt.Sprintf("%d minutes", span/time.Minute)
+			default:
+				w.Name = "Allowance"
+			}
+			if used, total, ok := miniMaxCount(x.count, x.total, x.left); ok {
+				w.Amount, w.Limit = used, total
+				if x.status == 2 {
+					w.Amount = total
+				}
+				if strings.EqualFold(name, "video") {
+					w.Unit = "videos"
+				}
+			}
+			if !general {
+				w.Name = strings.ToUpper(name[:1]) + name[1:] + " · " + w.Name
+				w.Aside = true
+			}
+			out = append(out, w)
+		}
+	}
+	return "", out, nil
+}
+
+// miniMaxCount is a MiniMax window's count, used of total, as mmx-cli's
+// quota panel reads it (1.0.27, dist/mmx.mjs): the usage_count field has
+// been seen to hold what remains rather than what is used, so it is
+// taken as whichever of the two the remaining percentage agrees with,
+// within a point, and as no count when neither does. A total of 0 (the
+// general bucket, metered in tokens) or a count outside it is no count.
+func miniMaxCount(count, total, left *float64) (used, of float64, ok bool) {
+	if count == nil || total == nil || left == nil || *total <= 0 || *count < 0 || *count > *total {
+		return 0, 0, false
+	}
+	c, t := *count, *total
+	asUsed := math.Abs((t-c)/t*100 - *left) // c is what is used: t-c remains
+	asLeft := math.Abs(c/t*100 - *left)     // c is what remains
+	switch {
+	case min(asUsed, asLeft) > 1:
+		return 0, 0, false
+	case asUsed < asLeft:
+		return c, t, true
+	default:
+		return t - c, t, true
+	}
 }
 
 // kimiCodeBase is Kimi Code's OpenAI endpoint, /coding/v1, for either of
@@ -177,6 +365,23 @@ func kimiCodeBase(base string) string {
 		return u + "/v1"
 	}
 	return u
+}
+
+// KimiCodeSearch is where a Kimi Code plan's key searches the web, as
+// kimi-cli's SearchWeb does (auth/platforms.py: the plan's search_url is
+// its base_url, /coding/v1, with /search), "" for a provider that isn't a
+// Kimi Code plan with a key.
+func KimiCodeSearch(p Provider) string {
+	if p.Account != nil || p.Key == "" {
+		return ""
+	}
+	for _, base := range []string{p.Chat, p.Anthropic} {
+		h := hostOf(base)
+		if base != "" && ((h == "api.kimi.com" || h == "api.kimi.ai") && strings.Contains(base, "/coding") || strings.HasPrefix(p.Preset, "kimi-code")) {
+			return strings.TrimSuffix(kimiCodeBase(base), "/") + "/search"
+		}
+	}
+	return ""
 }
 
 // readKimiCode reads Kimi Code's /usages, as kimi-cli's /usage does:
@@ -291,13 +496,62 @@ func planWindows(ctx context.Context, src planQuotaSource, key string) (plan str
 	}
 	defer res.Body.Close()
 	b, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+	openCode := strings.Contains(src.url, "opencode.ai")
 	switch {
-	case res.StatusCode == http.StatusForbidden && strings.Contains(src.url, "opencode.ai"):
-		return "", nil, fmt.Errorf("this key has no OpenCode Go subscription")
+	case res.StatusCode == http.StatusForbidden && openCode:
+		// OpenCode keeps Go on the member who subscribed, in the workspace
+		// they subscribed in, and asks for it by the key's own member and
+		// workspace (zen/go/v1/usage.ts in sst/opencode): a key another
+		// member made, or one from another workspace, has none
+		return "", nil, fmt.Errorf("this key has no OpenCode Go subscription: Go belongs to the member who subscribed, in that workspace, so use a key that member made there (opencode.ai, the workspace's API Keys)")
+	case res.StatusCode == http.StatusUnauthorized && openCode:
+		return "", nil, fmt.Errorf("OpenCode didn't take this key (%s): it was deleted, or is mistyped", vendorSaid(b, res.Status))
 	case res.StatusCode >= 300:
-		return "", nil, fmt.Errorf("%s", res.Status)
+		return "", nil, fmt.Errorf("%s", vendorSaid(b, res.Status))
 	}
 	return src.read(b)
+}
+
+// vendorSaid is the status, and the reason in a vendor's error body
+// ({"error":{"message":…}} or {"message":…}) when it gives one, so a card
+// that can't be read says why, not only a number.
+func vendorSaid(b []byte, status string) string {
+	var e struct {
+		Error   json.RawMessage `json:"error"`
+		Message string          `json:"message"`
+	}
+	if json.Unmarshal(b, &e) != nil {
+		return status
+	}
+	msg := e.Message
+	var inner struct {
+		Message string `json:"message"`
+	}
+	if json.Unmarshal(e.Error, &inner) == nil && inner.Message != "" {
+		msg = inner.Message
+	} else if s := ""; json.Unmarshal(e.Error, &s) == nil && s != "" {
+		msg = s
+	}
+	if msg = strings.TrimSpace(msg); msg == "" {
+		return status
+	}
+	if len(msg) > 200 {
+		msg = msg[:200] + "…"
+	}
+	return status + ": " + msg
+}
+
+// planKeyWindows asks the vendor for the plan key is on and its windows:
+// a Zhipu or Z.ai key with no plan of its own is a team's, whose windows
+// are asked with type=2 (zcode_team.go), and team says so.
+func planKeyWindows(ctx context.Context, p Provider, src planQuotaSource, key string) (plan string, ws []QuotaWindow, team bool, err error) {
+	plan, ws, err = planWindows(ctx, src, key)
+	if zhipu := strings.HasSuffix(src.url, "/api/monitor/usage/quota/limit"); zhipu && (err != nil || len(ws) == 0) {
+		if tplan, tws, terr := zhipuKeyTeamWindows(ctx, src.url, key, p.ZhipuTeam); terr == nil && len(tws) > 0 {
+			return tplan, tws, true, nil
+		}
+	}
+	return plan, ws, false, err
 }
 
 var planQuotaCache struct {
@@ -306,17 +560,25 @@ var planQuotaCache struct {
 	data []SubscriptionQuota
 }
 
+// ForgetPlanQuotas has the next PlanQuotas ask again, after what a plan's
+// windows are read with changed (a Volcengine or Tencent Cloud access key).
+func ForgetPlanQuotas() { forgetPlanQuotas() }
+
 // PlanQuotas is the windows of every plan magpie has a key for, each key
 // on a card of its own when a provider has several. What was asked less
 // than a minute ago is not asked again.
 func PlanQuotas(ctx context.Context) []SubscriptionQuota {
 	c := &planQuotaCache
+	_, again := refreshing(ctx) // one card read again (RefreshUsage)
 	c.Lock()
-	if c.data != nil && time.Since(c.at) < time.Minute {
+	// with allowances read only when asked, the cards stand as they were
+	// last read till the user asks (#1518)
+	if !again && c.data != nil && (time.Since(c.at) < time.Minute || heldRead(ctx)) {
 		defer c.Unlock()
 		return c.data
 	}
 	c.Unlock()
+	ctx, seq := quotaReading(ctx)
 	type job struct {
 		p    Provider
 		src  planQuotaSource
@@ -346,7 +608,9 @@ func PlanQuotas(ctx context.Context) []SubscriptionQuota {
 					user = Mask(k)
 				}
 			}
-			jobs = append(jobs, job{p, src, k, user})
+			if wantsCard(ctx, p.ID, user) {
+				jobs = append(jobs, job{p, src, k, user})
+			}
 		}
 	}
 	got := make([]*SubscriptionQuota, len(jobs))
@@ -356,15 +620,7 @@ func PlanQuotas(ctx context.Context) []SubscriptionQuota {
 		go func() {
 			defer wg.Done()
 			q := SubscriptionQuota{Provider: j.p.ID, Name: j.p.Name, Icon: j.p.Icon, User: j.user, Windows: []QuotaWindow{}}
-			plan, ws, err := planWindows(j.p.Via(ctx), j.src, j.key)
-			team := false
-			if zhipu := strings.HasSuffix(j.src.url, "/api/monitor/usage/quota/limit"); zhipu && (err != nil || len(ws) == 0) {
-				// no plan of the key's own: a team's key, whose windows are
-				// asked with type=2 (zcode_team.go)
-				if tplan, tws, terr := zhipuKeyTeamWindows(j.p.Via(ctx), j.src.url, j.key, j.p.ZhipuTeam); terr == nil && len(tws) > 0 {
-					plan, ws, err, team = tplan, tws, nil, true
-				}
-			}
+			plan, ws, team, err := planKeyWindows(j.p.Via(ctx), j.p, j.src, j.key)
 			// a vendor failing a while (Command Code answers billing/credits
 			// 503 at times) shows what was last read, as a subscription's
 			// card does, rather than no card or "Usage unavailable"
@@ -375,7 +631,7 @@ func PlanQuotas(ctx context.Context) []SubscriptionQuota {
 			case err != nil && !j.src.sure:
 				// no plan, unless one was read before
 				q.Error = err.Error()
-				if q = keepLast(q, tag); q.AsOf != nil {
+				if q = keepReading(ctx, q, tag); q.AsOf != nil {
 					got[i] = &q
 				}
 				return
@@ -383,27 +639,48 @@ func PlanQuotas(ctx context.Context) []SubscriptionQuota {
 				q.Error = err.Error()
 			default:
 				q.Plan, q.Windows = plan, ws
+				// what routing goes by, read just now (KeyAllowance)
+				k := j.p
+				k.Key = j.key
+				noteKeyAllowance(k, ws, time.Now())
 				if strings.HasSuffix(j.src.url, "/api/monitor/usage/quota/limit") && !team { // Zhipu, Z.ai
-					q.Until, q.Renew = zhipuTerm(ctx, zcodeRoot(j.src.url), j.key)
+					// the plan's term and its resets (#1191), asked together
+					root := zcodeRoot(j.src.url)
+					resets := make(chan *ResetCredits, 1)
+					go func() { resets <- zhipuPersonalResets(ctx, root, j.key) }()
+					q.Until, q.Renew = zhipuTerm(ctx, root, j.key)
+					q.Resets = <-resets
 				}
 			}
-			q = keepLast(q, tag)
+			q = keepReading(ctx, q, tag)
 			got[i] = &q
 		}()
 	}
 	stepfun := make(chan []SubscriptionQuota, 1)
 	go func() { stepfun <- stepPlanQuotas(ctx) }()
+	volc := make(chan []SubscriptionQuota, 1)
+	go func() { volc <- volcPlanQuotas(ctx) }()
+	tencent := make(chan []SubscriptionQuota, 1)
+	go func() { tencent <- tencentPlanQuotas(ctx) }()
 	wg.Wait()
 	out := []SubscriptionQuota{}
-	for _, q := range got {
+	for i, q := range got {
 		if q != nil {
+			// Set this after keepReading, which can restore a card from disk.
+			q.glmPlan = strings.HasSuffix(jobs[i].src.url, "/api/monitor/usage/quota/limit")
 			out = append(out, *q)
 		}
 	}
 	out = append(out, <-stepfun...)
+	out = append(out, <-volc...)
+	out = append(out, <-tencent...)
 	if ctx.Err() == nil {
+		noteQuotaHistory(out, time.Now())
 		c.Lock()
-		c.at, c.data = time.Now(), out
+		c.data = cacheCards(c.data, out, seq, again)
+		if !again {
+			c.at, out = time.Now(), c.data
+		}
 		c.Unlock()
 	}
 	return out

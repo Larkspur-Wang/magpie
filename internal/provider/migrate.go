@@ -26,6 +26,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"maps"
 	"net/http"
@@ -40,7 +41,9 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/filememo"
+	"github.com/yetone/magpie/internal/lastgood"
 	"github.com/yetone/magpie/internal/plugin"
+	"github.com/yetone/magpie/internal/settings"
 	"github.com/yetone/magpie/internal/update"
 )
 
@@ -87,7 +90,8 @@ type Migration struct {
 //	offline   magpie couldn't reach npm (or Bun's download) to install the plugin
 //	install   npm couldn't install it: line
 //	lapsed    every account of name needs signing in again
-//	unserved  the plugin doesn't serve models (their names)
+//	unserved  the plugin doesn't serve models (their names) for user (with
+//	          its plan), though the built-in does
 //	account   user doesn't work through the plugin: error
 type MoveWhy struct {
 	Code string            `json:"code"`
@@ -219,8 +223,20 @@ type mover struct {
 	// what else of the built-in's they carry (a key onto its provider),
 	// whose saving syncs the agents, which read the accounts.
 	settle func(auths map[string]map[string]any) error
+	// served is whether the plugin, listing listed, still serves model, one
+	// of the built-in's picks it doesn't list; nil for none.
+	served func(model string, listed []string) bool
+	// builtin is whether the built-in served model on account a, by the
+	// plan a is on; nil for every model on every account. One it didn't
+	// (a ZCode Start Plan account's GLM-5.3) is no loss when the plugin
+	// doesn't list it either.
+	builtin func(ctx context.Context, a Moving, model string) bool
 }
 
+// movers are the deprecated built-ins and their plugins, by id. Once one
+// is moved, its plugin serves it and the built-in's code no longer does:
+// each built-in's files say so (PLUGIN-SERVED, AGENTS.md), and
+// TestMovedBuiltinsSayTheirPlugin fails for a mover added without that.
 var movers = map[string]*mover{}
 
 // errStays is a back's answer for a sign-in the built-in has nowhere to
@@ -230,6 +246,17 @@ var errStays = errors.New("stays with the plugin")
 
 // Movable is whether the built-in id has a plugin it can move to.
 func Movable(id string) bool { return movers[id] != nil }
+
+// MovableIDs are the built-ins that have a plugin to move to, by id: the
+// page marks them deprecated, moved or not.
+func MovableIDs() []string {
+	out := make([]string, 0, len(movers))
+	for id := range movers {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
+}
 
 // MoveCandidate is a built-in with accounts its plugin could run instead.
 type MoveCandidate struct {
@@ -242,6 +269,9 @@ type MoveCandidate struct {
 // MoveCandidates are the built-ins not on their plugins that have accounts
 // to move, by name.
 func MoveCandidates() []MoveCandidate {
+	if settings.AccountDiscoveryOff() {
+		return nil
+	}
 	out := []MoveCandidate{}
 	for id, mv := range movers {
 		if Moved(id) {
@@ -267,13 +297,34 @@ func migrationsPath() string { return filepath.Join(filepath.Dir(Path()), "migra
 
 var migrationsMu sync.Mutex
 
-func readMigrations() map[string]Migration {
-	m, _ := filememo.Read("migrations", migrationsPath(), func(b []byte) (map[string]Migration, error) {
-		var m map[string]Migration
-		_ = json.Unmarshal(b, &m)
-		return m, nil
-	})
+// readMigrations is held while a request reads: the GUI's state asks each
+// provider's move several times over, thousands of looks at the file.
+func readMigrations() map[string]Migration { return heldOf("migrations", readMigrationsFile) }
+
+func readMigrationsFile() map[string]Migration {
+	m, err := filememo.Read("migrations", migrationsPath(), parseMigrations)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		// one that doesn't read (all zero after a crash, #1505) is not
+		// "nothing moved": a moved subscription would come back as its
+		// built-in, and the next move write that over every other's
+		if b, ferr := lastgood.Fallback(migrationsPath(), unreadBytes(migrationsPath()), validMigrations); ferr == nil {
+			m, _ = parseMigrations(b)
+		} else {
+			log.Printf("migrations.json: %v", ferr)
+		}
+	}
 	return m
+}
+
+func parseMigrations(b []byte) (map[string]Migration, error) {
+	var m map[string]Migration
+	err := json.Unmarshal(b, &m)
+	return m, err
+}
+
+func validMigrations(b []byte) bool {
+	_, err := parseMigrations(b)
+	return err == nil
 }
 
 // MigrationOf is where the built-in id's move stands.
@@ -320,7 +371,7 @@ func setMigration(id string, f func(m *Migration)) error {
 	migrationsMu.Lock()
 	defer migrationsMu.Unlock()
 	all := map[string]Migration{}
-	for k, v := range readMigrations() {
+	for k, v := range readMigrationsFile() {
 		all[k] = v
 	}
 	m := all[id]
@@ -328,6 +379,10 @@ func setMigration(id string, f func(m *Migration)) error {
 	all[id] = m
 	b, err := json.MarshalIndent(all, "", "  ")
 	if err != nil {
+		return err
+	}
+	defer Changed()
+	if err := lastgood.Keep(migrationsPath(), validMigrations, 0o600); err != nil {
 		return err
 	}
 	return writePrivate(migrationsPath(), append(b, '\n'))
@@ -367,6 +422,7 @@ func lockMoves() (func(), error) {
 // Hooks the tests stand in for.
 var (
 	installPlugin = func(ctx context.Context, pkg, min string) error {
+		older := false
 		for _, e := range plugin.Load().Plugins {
 			if plugin.PackageName(e.Spec) != pkg {
 				continue
@@ -381,9 +437,18 @@ var (
 			if plugin.IsPath(e.Spec) {
 				return fmt.Errorf("%s at %s is %s; moving needs %s or newer", pkg, e.Spec, v, min)
 			}
+			older = !plugin.IsGit(e.Spec)
 			break
 		}
-		_, err := plugin.Add(ctx, pkg)
+		var err error
+		if older {
+			// npm's newest, which bun says why it won't install (a
+			// minimumReleaseAge), where bun's own latest is an older
+			// version without a word (sweanng424 on Discord)
+			err = plugin.Upgrade(ctx, pkg)
+		} else {
+			_, err = plugin.Add(ctx, pkg)
+		}
 		if err == nil && min != "" {
 			if v := plugin.Version(pkg); update.Newer(min, v) {
 				return fmt.Errorf("%s %s is installed; moving needs %s or newer", pkg, v, min)
@@ -413,6 +478,9 @@ var modelsInUse = func(id string) []string {
 // Move puts the built-in id's accounts onto its plugin (see above). An
 // error leaves the built-in as it was.
 func Move(ctx context.Context, id string) error {
+	if settings.AccountDiscoveryOff() {
+		return errAccountDiscoveryOff
+	}
 	mv := movers[id]
 	if mv == nil {
 		return fmt.Errorf("%s has no plugin to move to", id)
@@ -435,6 +503,51 @@ func Move(ctx context.Context, id string) error {
 		})
 		if me := (*moveError)(nil); errors.As(err, &me) && me.err != nil {
 			log.Printf("moving %s to its plugin: %s (%s)", id, me.msg, me.err)
+		}
+	}
+	return err
+}
+
+// Adopt puts the built-in id onto its plugin before any account of it is
+// signed in: the plugin installed, and the subscription signs in through
+// it from now on, as a moved one does. One with accounts is moved instead.
+func Adopt(ctx context.Context, id string) error {
+	if settings.AccountDiscoveryOff() {
+		return errAccountDiscoveryOff
+	}
+	mv := movers[id]
+	if mv == nil {
+		return fmt.Errorf("%s has no plugin to move to", id)
+	}
+	if accts, err := mv.out(); err != nil {
+		return err
+	} else if len(accts) > 0 {
+		return Move(ctx, id)
+	}
+	unlock, err := lockMoves()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if Moved(id) {
+		return nil
+	}
+	had := pluginListed(mv.pkg)
+	if err := installPlugin(ctx, mv.pkg, mv.min); err != nil {
+		return installFailed(mv.pkg, err)
+	}
+	pps, err := pluginProviders(ctx)
+	if err == nil && !slices.ContainsFunc(pps, func(p plugin.Provider) bool { return p.ID == id && plugin.PackageName(p.Spec) == mv.pkg }) {
+		err = fmt.Errorf("%s doesn't serve %s", mv.pkg, id)
+	}
+	if err == nil {
+		err = setMigration(id, func(m *Migration) {
+			*m = Migration{State: MovePlugin, Package: mv.pkg, At: time.Now().UTC().Truncate(time.Second), Installed: !had}
+		})
+	}
+	if err != nil && !had {
+		if rerr := removePlugin(context.WithoutCancel(ctx), mv.pkg); rerr != nil {
+			log.Printf("removing %s after %s failed to go onto it: %s", mv.pkg, id, rerr)
 		}
 	}
 	return err
@@ -527,13 +640,26 @@ func move(ctx context.Context, id string, mv *mover) (err error) {
 			notePluginLapse(pp, moved[i].Key, http.StatusUnauthorized)
 			continue
 		}
+		if err != nil && signInGone.MatchString(err.Error()) {
+			// the plugin says in words the sign-in is gone (Grok's past
+			// its time): it moves along untried, as a lapsed one does, and
+			// unmarked, as the plugin's own reads leave its accounts
+			continue
+		}
 		if err != nil {
 			return &moveError{MoveWhy{Code: "account", Args: map[string]string{"user": a.User, "error": err.Error()}}, fmt.Sprintf("%s doesn't work through the plugin: %s", a.User, err), err}
 		}
 		if !tried {
-			if missing := slices.DeleteFunc(slices.Clone(inUse), func(m string) bool { return slices.Contains(c.Models, m) }); len(missing) > 0 {
+			if missing := slices.DeleteFunc(slices.Clone(inUse), func(m string) bool {
+				return slices.Contains(c.Models, m) || mv.served != nil && mv.served(m, c.Models) ||
+					mv.builtin != nil && !mv.builtin(ctx, a, m)
+			}); len(missing) > 0 {
 				names := strings.Join(modelNames(id, missing), ", ")
-				return &moveError{MoveWhy{Code: "unserved", Args: map[string]string{"models": names}}, fmt.Sprintf("the plugin doesn't serve %s. Untick them under Models, or keep the built-in.", names), nil}
+				who := a.User
+				if a.Plan != "" {
+					who += " (" + a.Plan + ")"
+				}
+				return &moveError{MoveWhy{Code: "unserved", Args: map[string]string{"models": names, "user": who}}, fmt.Sprintf("the plugin doesn't serve %s for %s, though the built-in does. Untick them under Models, or keep the built-in.", names, who), nil}
 			}
 			tried = true
 		}
@@ -571,7 +697,9 @@ func modelNames(id string, ids []string) []string {
 		if names[m] != "" {
 			m = names[m]
 		}
-		out = append(out, m)
+		if !slices.Contains(out, m) {
+			out = append(out, m)
+		}
 	}
 	return out
 }
@@ -828,6 +956,9 @@ func MoveBack(ctx context.Context, id string) error {
 // serves nothing else now, which releasePlugin, about to remove or turn
 // off the plugin itself, leaves to its caller.
 func moveBack(ctx context.Context, id string, tidy bool) error {
+	if settings.AccountDiscoveryOff() {
+		return errAccountDiscoveryOff
+	}
 	mv := movers[id]
 	if mv == nil {
 		return fmt.Errorf("%s isn't a built-in subscription", id)
@@ -994,6 +1125,9 @@ func pluginOn(id string) map[string]bool {
 // start-up: once, or again moveRetry after one failed. One the user moved
 // back stays.
 func MoveRetiring(ctx context.Context) map[string]error {
+	if settings.AccountDiscoveryOff() {
+		return nil
+	}
 	out := map[string]error{}
 	for _, id := range Retiring {
 		m, ok := MigrationOf(id)
@@ -1014,6 +1148,68 @@ func MoveRetiring(ctx context.Context) map[string]error {
 	return out
 }
 
+// HandOver gives each deprecated built-in whose plugin the user has
+// installed, at the version its move needs, and which that plugin serves,
+// its id, so one subscription is never listed twice: the built-in, and the
+// plugin's under "<id>-plugin" (ARNO on Discord: Qoder CN twice once the
+// Qoder plugin's 0.2.0 served it, as nothing gave it the id). One with no
+// accounts is the plugin's at once, as Adopt makes it; with accounts too,
+// one that has some is moved (Move: each tried through the plugin, all put
+// back on any failure, the built-in carrying on). One the plugin has
+// accounts of its own for already is left as it is, since its models are
+// in use as <id>-plugin's and the id changing would leave agents asking
+// for a provider gone; the add sheet lists it once regardless. One the
+// user moved back stays built-in, and a failed move waits moveRetry. No
+// plugin is installed for it: the user's own install is what says to.
+func HandOver(ctx context.Context, accounts bool) map[string]error {
+	if settings.AccountDiscoveryOff() {
+		return nil
+	}
+	out := map[string]error{}
+	var pps []plugin.Provider
+	asked := false
+	for _, id := range MovableIDs() {
+		mv := movers[id]
+		if m, ok := MigrationOf(id); ok && (m.State != MoveFailed || time.Since(m.At) < moveRetry) {
+			continue
+		}
+		if !pluginReady(mv) {
+			continue
+		}
+		if !asked {
+			var err error
+			if pps, err = pluginProviders(ctx); err != nil {
+				return out
+			}
+			asked = true
+		}
+		i := slices.IndexFunc(pps, func(p plugin.Provider) bool { return p.ID == id && plugin.PackageName(p.Spec) == mv.pkg })
+		if i < 0 || pps[i].SignedIn || len(pps[i].Accounts) > 0 {
+			continue
+		}
+		accts, err := mv.out()
+		switch {
+		case err != nil:
+		case len(accts) == 0:
+			out[id] = Adopt(ctx, id)
+		case accounts:
+			out[id] = Move(ctx, id)
+		}
+	}
+	return out
+}
+
+// pluginReady is whether the mover's plugin is installed, switched on and
+// at the version its move needs.
+func pluginReady(mv *mover) bool {
+	for _, e := range plugin.Load().Plugins {
+		if plugin.PackageName(e.Spec) == mv.pkg {
+			return !e.Off && (mv.min == "" || !update.Newer(mv.min, plugin.Version(e.Spec)))
+		}
+	}
+	return false
+}
+
 // keepMovedCurrent updates the plugin of each built-in moved onto one to
 // the version its move needs, when older: a built-in came up to date with
 // magpie, and its plugin does too. One turned off or run from a folder is
@@ -1030,7 +1226,8 @@ func keepMovedCurrent(ctx context.Context) {
 	}
 }
 
-// KeepRetiringMoved moves the built-ins being retired, run by the magpie
+// KeepRetiringMoved moves the built-ins being retired, and hands over
+// those whose plugin the user installed (HandOver), run by the magpie
 // serving the gateway (one magpie, never two at once): a little after it
 // starts, then every hour, so a failed move is tried again once moveRetry
 // has gone. It also keeps each moved built-in's plugin up to date.
@@ -1043,8 +1240,14 @@ func KeepRetiringMoved(ctx context.Context) {
 			return
 		case <-t.C:
 		}
+		if settings.AccountDiscoveryOff() {
+			t.Reset(time.Hour)
+			continue
+		}
 		keepMovedCurrent(ctx)
-		for id, err := range MoveRetiring(ctx) {
+		moves := MoveRetiring(ctx)
+		maps.Copy(moves, HandOver(ctx, true))
+		for id, err := range moves {
 			if err != nil {
 				log.Printf("moving %s to its plugin: %s (it stays built-in)", id, err)
 			} else {

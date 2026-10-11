@@ -60,7 +60,7 @@ function serve(lang) {
 
 const want = {
   en: { tags: ["Web search", "Web search", "", "Title"], story: /magpie ran this web search for Codex's deepseek\/deepseek-flash, which can't search the web by itself: codex\/gpt-6\.1-sol searched/, bare: /for a model that can't search the web by itself: codex\/gpt-6\.1-sol searched/, title: /Codex made this call itself \(Title\)/ },
-  zh: { tags: ["联网搜索", "联网搜索", "", "标题"], story: /magpie 替 Codex 的 deepseek\/deepseek-flash 发起的联网搜索.*由 codex\/gpt-6\.1-sol 去搜/, bare: /替一个自己不能搜索网页的模型发起的联网搜索：由 codex\/gpt-6\.1-sol 去搜/, title: /这是 Codex 自己发起的调用（标题）/ },
+  zh: { tags: ["联网搜索", "联网搜索", "", "标题"], story: /magpie 代 Codex 的 deepseek\/deepseek-flash 发起的联网搜索.*由 codex\/gpt-6\.1-sol 搜索/, bare: /代一个无法自行搜索的模型发起的联网搜索：由 codex\/gpt-6\.1-sol 搜索/, title: /Codex 自行发起的调用（标题）/ },
 };
 
 for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
@@ -80,15 +80,29 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         }
         await browser.close();
       });
+      // Routing's groups, drawn above the list, can land after the day's
+      // list does and push it down (#1640): what is measured below is the
+      // page with them in
+      const grouped = page.waitForResponse((r) => new URL(r.url()).pathname === "/api/groups");
       await page.goto("http://magpie.test/?view=routing");
-      await page.locator(".rt-day").nth(1).click();
+      await page.locator(".rt-days .rt-day").nth(1).click();
       await page.locator(".rt-req").nth(routes.length - 1).waitFor();
+      await grouped;
 
       const tags = await page.locator(".rt-req").evaluateAll((rows) => rows.map((r) => r.querySelector(".asked .kind")?.textContent || ""));
       assert.deepEqual(tags, want[lang].tags);
 
       const story = async (i) => {
         const row = page.locator(".rt-req").nth(i);
+        // the list is there a frame or two before the page is done with it:
+        // the next frame's redraw and fit grow the part above, and the day
+        // clicked is held in place by scrolling. Where the row was is taken
+        // once it has stayed put for 10 frames, not as it is drawn (#1640)
+        await row.evaluate((e) => new Promise((done) => {
+          let last = e.getBoundingClientRect().top, still = 0;
+          const look = () => { const y = e.getBoundingClientRect().top; if (y === last) still++; else { last = y; still = 0; } if (still >= 10) done(); else requestAnimationFrame(look); };
+          requestAnimationFrame(look);
+        }));
         const was = await row.evaluate((e) => e.getBoundingClientRect().top);
         const scrolled = await page.evaluate(() => document.scrollingElement.scrollTop);
         await row.click();

@@ -1,5 +1,14 @@
 package provider
 
+// PLUGIN-SERVED (see AGENTS.md): Kiro ("kiro") is a deprecated built-in
+// subscription served by its plugin, @magpie-community/opencode-kiro-auth,
+// once moved onto it (provider.Moved; the default for a new sign-in). A
+// moved one's sign-ins, models, requests and usage are all the plugin's,
+// never this code's (only the move, in migrate*.go, still reads its
+// accounts). A fix here alone doesn't reach those users; fix the plugin
+// (github.com/magpie-community/plugins, packages/kiro) and raise the mover's
+// min in internal/provider/migrate_kiro.go.
+
 // Signing in to Kiro from magpie, the way the Kiro IDE does: Kiro's sign-in
 // page (app.kiro.dev) offers Google, GitHub, AWS Builder ID and IAM
 // Identity Center, and sends the browser back to a port on this machine.
@@ -64,7 +73,7 @@ type kiroSaved struct {
 
 // readKiroFile reads a sign-in made in magpie.
 func readKiroFile(path string) (kiroCred, bool) {
-	b, err := os.ReadFile(path)
+	b, err := readAccountFile(path)
 	if err != nil {
 		return kiroCred{}, false
 	}
@@ -73,7 +82,7 @@ func readKiroFile(path string) (kiroCred, bool) {
 		return kiroCred{}, false
 	}
 	c := kiroCred{access: t.AccessToken, refresh: t.RefreshToken, region: t.Region, profile: t.ProfileArn,
-		clientID: t.ClientID, clientSecret: t.ClientSecret, idePath: path}
+		clientID: t.ClientID, clientSecret: t.ClientSecret, idePath: path, builderID: strings.EqualFold(t.Provider, "BuilderId")}
 	c.expires, _ = time.Parse(time.RFC3339Nano, t.ExpiresAt)
 	if c.region == "" {
 		c.region = "us-east-1"
@@ -148,7 +157,7 @@ func (s *signInFlow) kiroCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	k := s.kiro
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(s.via(r.Context()), 30*time.Second)
 	defer cancel()
 	var saved kiroSaved
 	switch {

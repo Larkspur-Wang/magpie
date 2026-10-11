@@ -4,13 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/yetone/magpie/internal/plugin"
+	"github.com/yetone/magpie/internal/testenv"
 	"github.com/yetone/magpie/internal/zed"
 )
 
@@ -18,10 +18,7 @@ import (
 // the plugin not yet installed: the move's install adds it.
 func fakePlugin(t *testing.T, inUse *[]string) (context.Context, string, *int) {
 	t.Helper()
-	bun, err := exec.LookPath("bun")
-	if err != nil {
-		t.Skip("no bun on PATH")
-	}
+	bun := testenv.Bun(t)
 	claudeHome(t)
 	t.Setenv("MAGPIE_BUN", bun)
 	t.Cleanup(plugin.Settle)
@@ -220,5 +217,40 @@ func TestMovedShowsBuiltinHost(t *testing.T) {
 	_ = setMigration("devin", func(m *Migration) { *m = Migration{State: MovePlugin} })
 	if h := pluginProvider(plugin.Provider{ID: "devin"}, pluginLogin{}).Host(); h != "" {
 		t.Fatalf("moved devin: %q", h)
+	}
+}
+
+// A built-in with no account signed in goes onto its plugin as it is: the
+// plugin installed and the subscription its from then on, so the first
+// sign-in is the plugin's. Going back takes the plugin it installed away.
+// One with an account is moved.
+func TestAdoptBeforeSigningIn(t *testing.T) {
+	inUse := []string{"fake-1"}
+	ctx, abs, installs := fakePlugin(t, &inUse)
+	if err := Adopt(ctx, "fakeco"); err != nil {
+		t.Fatal(err)
+	}
+	if m, _ := MigrationOf("fakeco"); m.State != MovePlugin || !m.Installed || !pluginListed(abs) || *installs != 1 {
+		t.Fatalf("adopted: %+v, listed %v, %d installs", m, pluginListed(abs), *installs)
+	}
+	if PluginID("fakeco") != "fakeco" {
+		t.Fatalf("the plugin's provider is %s", PluginID("fakeco"))
+	}
+	if err := Adopt(ctx, "fakeco"); err != nil || *installs != 1 {
+		t.Fatalf("adopting again: %v, %d installs", err, *installs)
+	}
+	if err := MoveBack(ctx, "fakeco"); err != nil {
+		t.Fatal(err)
+	}
+	if Moved("fakeco") || pluginListed(abs) {
+		t.Fatalf("back: moved %v, listed %v", Moved("fakeco"), pluginListed(abs))
+	}
+
+	setFakeLogins(t, fakeLogin("a@fake", "r-a", true, true))
+	if err := Adopt(ctx, "fakeco"); err != nil {
+		t.Fatal(err)
+	}
+	if !Moved("fakeco") || !plugin.SignedIn("fakeco") || len(fakeSaved(t)) != 0 {
+		t.Fatalf("adopting one signed in didn't move it: moved %v, saved %+v", Moved("fakeco"), fakeSaved(t))
 	}
 }

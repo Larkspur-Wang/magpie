@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/testenv"
 )
 
 // fakeClaudeCalling answers each line with a reply that calls one of the
@@ -48,7 +49,7 @@ while read -r line; do
   echo '{"type":"stream_event","event":{"type":"message_stop"}}'
 done
 `
-	os.WriteFile(filepath.Join(dir, "claude"), []byte(script), 0o755)
+	testenv.Program(t, filepath.Join(dir, "claude"), script)
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	return dir
 }
@@ -213,5 +214,16 @@ func TestClaudeRunEndsWhenTheClientLeaves(t *testing.T) {
 	}
 	if leftover([]int{pid}, 3*time.Second) != 0 {
 		t.Fatal("Claude Code still runs after its client left")
+	}
+}
+
+// A run waiting for its conversation's next turn is kept as long as the
+// prompt cache Claude Code writes on a subscription lasts, an hour: let go
+// at twenty minutes, a turn after half an hour went to a new run told the
+// whole conversation in one message, which wrote all of it to the cache
+// again while what the old run wrote was still there to read (#463).
+func TestClaudeIdleRunKeptWhileItsCacheLasts(t *testing.T) {
+	if claudeCacheTTL < time.Hour || idleLongest < claudeCacheTTL {
+		t.Fatalf("an idle run is let go after %s, before the cache it wrote, kept %s, expires", idleLongest, claudeCacheTTL)
 	}
 }

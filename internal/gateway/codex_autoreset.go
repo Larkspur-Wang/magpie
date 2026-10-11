@@ -1,14 +1,14 @@
 package gateway
 
-// A Codex rate-limit reset, or a Claude usage-limit reset, spent by
-// itself: when everyone a request could go to is out of their allowance,
-// a ChatGPT or Claude account the user lets spend its resets, its weekly
-// window used up, spends one and is asked again
-// (provider.AutoUseCodexReset and AutoUseClaudeReset have the rules).
+// A Codex rate-limit reset spent by itself: when everyone a request could
+// go to is out of their allowance, a ChatGPT account the user lets spend
+// its resets, its weekly window used up, spends one and is asked again
+// (provider.AutoUseCodexReset has the rules).
 
 import (
 	"context"
 	"log"
+	"slices"
 	"strings"
 	"time"
 
@@ -18,10 +18,13 @@ import (
 // autoResetTimeout bounds the look at an account's week and the reset.
 var autoResetTimeout = 20 * time.Second
 
-// autoReset spends a reset of one of cands' Codex or Claude accounts, c — the last
+// autoReset spends a reset of one of cands' Codex accounts, c — the last
 // one, just out of its allowance — first: only when every other one of
-// them sits out too. It says which account it was and what spending did.
-func (s *Server) autoReset(ctx context.Context, cands []candidate, c candidate) (candidate, provider.ResetOutcome, bool) {
+// them sits out too. held are accounts left out as they won't spend their
+// credits (planned.held): they sit out, and are out of their allowance as
+// c is, so one of them may spend one after cands'. It says which account it
+// was and what spending did.
+func (s *Server) autoReset(ctx context.Context, cands []candidate, c candidate, held []candidate) (candidate, provider.ResetOutcome, bool) {
 	for _, x := range cands {
 		if x.restKey() == c.restKey() {
 			continue
@@ -35,7 +38,7 @@ func (s *Server) autoReset(ctx context.Context, cands []candidate, c candidate) 
 		}
 	}
 	seen := map[string]bool{}
-	for _, x := range append([]candidate{c}, cands...) {
+	for _, x := range append(append([]candidate{c}, cands...), held...) {
 		a := x.p.Account
 		if a == nil || a.User == "" || seen[x.restKey()] || !provider.AutoResets(a.Agent, a.User) {
 			continue
@@ -43,6 +46,7 @@ func (s *Server) autoReset(ctx context.Context, cands []candidate, c candidate) 
 		seen[x.restKey()] = true
 		if out, ok := autoResetOf(ctx, a.Agent, a.User); ok {
 			s.Unrest(x.restKey())
+			x.capped = nil // its windows started again: held no more
 			return x, out, true
 		}
 	}
@@ -68,11 +72,7 @@ func (s *Server) autoResetSignedIn(ctx context.Context) (string, provider.ResetO
 func autoResetOf(ctx context.Context, agent, user string) (provider.ResetOutcome, bool) {
 	ctx, cancel := context.WithTimeout(ctx, autoResetTimeout)
 	defer cancel()
-	use := provider.AutoUseCodexReset
-	if agent == "claude" {
-		use = provider.AutoUseClaudeReset
-	}
-	out, err := use(ctx, user)
+	out, err := provider.AutoUseCodexReset(ctx, user)
 	switch {
 	case err != nil:
 		log.Printf("%s reset for %s not used: %v", agent, user, err)
@@ -82,4 +82,17 @@ func autoResetOf(ctx context.Context, agent, user string) (provider.ResetOutcome
 		log.Printf("%s reset for %s not used: %s", agent, user, out.Text())
 	}
 	return out, err == nil && out.Code == "reset"
+}
+
+// unhold moves the account c of a plan's left, held as it won't spend its
+// credits, to its order: a reset started its windows again, and it is
+// tried.
+func unhold(order, left []Weighed, c candidate) ([]Weighed, []Weighed) {
+	i := slices.IndexFunc(left, func(w Weighed) bool { return w.ID == c.rest && w.NoCredits })
+	if i < 0 {
+		return order, left
+	}
+	w := left[i]
+	w.Unlisted, w.Capped, w.CapBack, w.NoCredits = false, 0, nil, false
+	return append(slices.Clip(order), w), slices.Delete(slices.Clone(left), i, i+1)
 }

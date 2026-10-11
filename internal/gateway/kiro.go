@@ -1,5 +1,14 @@
 package gateway
 
+// PLUGIN-SERVED (see AGENTS.md): Kiro ("kiro") is a deprecated built-in
+// subscription served by its plugin, @magpie-community/opencode-kiro-auth,
+// once moved onto it (provider.Moved; the default for a new sign-in). A
+// moved one's sign-ins, models, requests and usage are all the plugin's,
+// never this code's (only the move, in migrate*.go, still reads its
+// accounts). A fix here alone doesn't reach those users; fix the plugin
+// (github.com/magpie-community/plugins, packages/kiro) and raise the mover's
+// min in internal/provider/migrate_kiro.go.
+
 // A Kiro subscription is served through Kiro's own API, the one kiro-cli
 // talks to (after github.com/mikeyobrien/pi-provider-kiro): each request
 // is sent whole as a conversation — the earlier turns as its history, the
@@ -39,10 +48,12 @@ func (s *Server) serveKiro(w http.ResponseWriter, r *http.Request, from provider
 	if err != nil {
 		return writeError(w, from, 400, err.Error()), err.Error()
 	}
+	// the vendor's own API is told the answer's format in words
+	req = req.inSystem()
 	req.Model = model
 	ask := s.askKiro(p, model)
 	if req.WebSearch && !searching(r.Context()) {
-		if _, _, ok := searcher(); ok {
+		if canSearch() {
 			return s.searchReply(w, r, from, "Kiro", req, usage, ask)
 		}
 	}
@@ -52,7 +63,7 @@ func (s *Server) serveKiro(w http.ResponseWriter, r *http.Request, from provider
 	if events == nil {
 		return writeError(w, from, status, msg), msg
 	}
-	return relay(w, r, from, "Kiro", req, events, usage, cancel, func(string, string, bool) {})
+	return relay(w, r, from, "Kiro", req, events, usage, cancel, nil, func(string, string, bool) {})
 }
 
 // askKiro is a round for Kiro's API.
@@ -113,7 +124,11 @@ func (s *Server) sendKiro(ctx context.Context, auth provider.KiroAuth, body []by
 	} {
 		req.Header.Set(k, v)
 	}
-	return s.client.Do(req)
+	res, err := s.client.Do(req)
+	if err != nil {
+		return res, err
+	}
+	return notAnAPIReply(res, ""), nil // a web page served 200 (#1012)
 }
 
 // kiroFailure is the status and message for an error Kiro answered with:

@@ -18,6 +18,7 @@ import (
 // Pi's ~/.pi is left alone; its own model takes magpie out again.
 func TestOmo(t *testing.T) {
 	home := syncHome(t)
+	t.Setenv("PATH", t.TempDir()) // no omo on PATH: only its folder tells (#1646)
 	var a *Agent
 	for _, x := range All() {
 		if x.ID == "omo" {
@@ -112,7 +113,7 @@ func TestOmoDir(t *testing.T) {
 
 // The WSL probe asks after OmO too.
 func TestWSLProbeFindsOmo(t *testing.T) {
-	for _, want := range []string{`[ -d "$HOME/.omo" ] && echo dir:.omo`, `command -v omo >/dev/null 2>&1 && echo bin:omo`} {
+	for _, want := range []string{`[ -d "$HOME/.omo" ] && echo dir:.omo`, `p=$(command -v omo 2>/dev/null || wslbin omo) && echo "bin:omo $p"`} {
 		if !strings.Contains(wslProbeScript, want) {
 			t.Errorf("probe lacks %q", want)
 		}

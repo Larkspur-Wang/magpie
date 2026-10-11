@@ -28,6 +28,35 @@ func reseatHome(t *testing.T) string {
 	return home
 }
 
+// A group Claude Code is on carries its [1m] mark in the agent's own
+// settings, as a model's does. sameModel reads that ref back when the
+// group's model is down to one provider and the agent has to be moved to
+// the same model elsewhere, so the mark has to come off there too: leaving
+// it on compares "auto-gpt-5[1m]" with "auto-gpt-5" and finds nothing,
+// and an agent whose group is gone is left on it.
+func TestSameModelTakesTheOneMMarkOffAGroupRef(t *testing.T) {
+	reseatHome(t)
+	for _, p := range []provider.Provider{
+		{ID: "other", Name: "Other", Chat: "https://other.example/v1", Key: "k", Models: []string{"gpt-5"}},
+	} {
+		if err := provider.Save(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	opts := []Option{{Value: "magpie/group/auto-gpt-5", Ref: "group/auto-gpt-5"}, {Value: "other/gpt-5", Ref: "other/gpt-5"}}
+	if got := sameModel(opts, "group/auto-gpt-5[1m]"); got.Ref != "other/gpt-5" {
+		t.Errorf("[1m] on the group: %+v", got)
+	}
+	if got := sameModel(opts, "group/auto-gpt-5"); got.Ref != "other/gpt-5" {
+		t.Errorf("the bare group: %+v", got)
+	}
+	// a group that is nobody else's still gives nothing (nothing to move to)
+	none := []Option{{Value: "magpie/group/mine", Ref: "group/mine"}, {Value: "other/gpt-5", Ref: "other/gpt-5"}}
+	if got := sameModel(none, "group/mine[1m]"); got.Ref != "" {
+		t.Errorf("a group of the user's own: %+v", got)
+	}
+}
+
 func mustFind(t *testing.T, id string) *Agent {
 	t.Helper()
 	a, err := Find(id)
@@ -65,7 +94,7 @@ func TestReseatOff(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := map[string]string{"model": "ds/gpt-5", "opus": "ds/claude-sonnet-4-5-20250929",
-		"haiku": "", "sonnet": "", "fable": ""} // haiku follows the main model; sonnet was ds/gpt-5 already
+		"haiku": "", "sonnet": "ds/gpt-5", "fable": ""} // haiku follows the main model; sonnet keeps the ds/gpt-5 picked for it, now the main model too (#1050)
 	for k, w := range want {
 		if got := c.Field(k).Get(); got != w {
 			t.Errorf("claude %s: %q, want %q", k, got, w)
@@ -175,5 +204,35 @@ func TestReseatUnmovable(t *testing.T) {
 	}
 	if s := stuck.String(); !strings.Contains(s, "not moved") {
 		t.Errorf("String: %q", s)
+	}
+}
+
+// Found groups turned off (蓝猫 on Discord) take every group/auto-… away:
+// an agent on one is moved to its model from the first provider still
+// serving it, however that one spells it, rather than to its own default.
+func TestReseatFoundGroupsOff(t *testing.T) {
+	reseatHome(t)
+	c, h := mustFind(t, "claude"), mustFind(t, "hermes")
+	mustApply(t, c, "model", "group/auto-gpt-5")
+	mustApply(t, c, "opus", "group/auto-claude-sonnet-4-5")
+	mustApply(t, h, "model", "magpie/group/auto-gpt-5")
+	moves, err := Reseat(func() error { return provider.SetAutoGroups(false) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	for k, w := range map[string]string{"model": "cop/gpt-5", "opus": "cop/claude-sonnet-4.5"} {
+		if got := c.Field(k).Get(); got != w {
+			t.Errorf("claude %s: %q, want %q", k, got, w)
+		}
+	}
+	if got := h.Field("model").Get(); got != "magpie/cop/gpt-5" {
+		t.Errorf("hermes: %q", got)
+	}
+	if len(moves) != 3 || moves[0].From != "group/auto-gpt-5" || moves[0].To != "cop/gpt-5" {
+		t.Errorf("moves: %+v", moves)
+	}
+	// on again, nobody is moved back or elsewhere
+	if moves, err = Reseat(func() error { return provider.SetAutoGroups(true) }); err != nil || len(moves) != 0 {
+		t.Fatalf("on again: %+v %v", moves, err)
 	}
 }

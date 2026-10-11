@@ -3,7 +3,6 @@ package provider
 import (
 	"context"
 	"math"
-	"slices"
 	"time"
 )
 
@@ -13,49 +12,38 @@ import (
 // what doesn't answer before ctx ends comes back with an error.
 func Quotas(ctx context.Context) []SubscriptionQuota {
 	subs, plans, balances := quotas(ctx)
-	return append(append(subs, plans...), balances...)
+	return cardsServed(subs, plans, balances, LastServed())
+}
+
+// Allotted is Quotas without the keys' balances: the accounts and plans
+// whose allowance runs out and starts again, which is what magpie quota
+// wait waits on; no key's balance is asked for.
+func Allotted(ctx context.Context) []SubscriptionQuota {
+	plans, subs := seatCards(PlanQuotas(ctx), SubscriptionUsage(ctx))
+	return append(withAccountNames(subs), plans...)
 }
 
 func quotas(ctx context.Context) (subs, plans, balances []SubscriptionQuota) {
 	b := make(chan []SubscriptionQuota, 1)
 	p := make(chan []SubscriptionQuota, 1)
+	r := make(chan []SubscriptionQuota, 1)
 	go func() { b <- KeyBalances(ctx) }()
 	go func() { p <- PlanQuotas(ctx) }()
-	subs = SubscriptionUsage(ctx)
-	return subs, notShown(<-p, subs), <-b
-}
-
-// notShown is the plans not already on a subscription's card: a GLM
-// Coding plan read with a Zhipu or Z.ai key is the ZCode account's own
-// when ZCode is signed in to the same account, and shown once, on its
-// card, which counts the calls. plans, PlanQuotas' cache, is left as it is.
-func notShown(plans, subs []SubscriptionQuota) []SubscriptionQuota {
-	return slices.DeleteFunc(slices.Clone(plans), func(p SubscriptionQuota) bool {
-		return slices.ContainsFunc(subs, func(s SubscriptionQuota) bool { return sameAccount(p, s) })
-	})
-}
-
-// sameAccount reports whether two cards are one account read twice: every
-// window of the same length both say when they start again starts again
-// at the same moment, and there is one such at least — a window's reset
-// is when that account first used it.
-func sameAccount(a, b SubscriptionQuota) bool {
-	if a.Error != "" || b.Error != "" {
-		return false
-	}
-	matched := false
-	for _, x := range a.Windows {
-		for _, y := range b.Windows {
-			if x.Aside || y.Aside || x.Span == 0 || x.Span != y.Span || x.ResetsAt == nil || y.ResetsAt == nil {
-				continue
-			}
-			if !x.ResetsAt.Equal(*y.ResetsAt) {
-				return false
-			}
-			matched = true
+	go func() { r <- RemoteCards(ctx) }()
+	plans, subs = seatCards(<-p, SubscriptionUsage(ctx))
+	subs, balances = withAccountNames(subs), <-b
+	// a remote magpie's cards, each after this computer's of its kind
+	for _, q := range <-r {
+		switch q.Kind {
+		case "plan":
+			plans = append(plans, q)
+		case "balance":
+			balances = append(balances, q)
+		default:
+			subs = append(subs, q)
 		}
 	}
-	return matched
+	return subs, plans, balances
 }
 
 // Quota is one account's or key's allowance as magpie quota --json and
@@ -72,37 +60,68 @@ type Quota struct {
 	Windows  []QuotaSpan `json:"windows"`
 	Balance  string      `json:"balance,omitempty"`
 	Error    string      `json:"error,omitempty"`
+	AsOf     *time.Time  `json:"asOf,omitempty"` // the cached reading's time, nil for a new one
+	// ReadAt is when the windows or balance shown were read, nil when not
+	// known; a Claude account's can be well before now (claudeReadAt).
+	ReadAt *time.Time `json:"readAt,omitempty"`
 	// Until is when the plan's paid time ends, renewed then when Renew is
 	// "auto", over when "off", either when "".
 	Until *time.Time `json:"until,omitempty"`
 	Renew string     `json:"renew,omitempty"`
 	// Resets are a Codex account's rate-limit resets, when it holds any.
 	Resets *ResetCredits `json:"resets,omitempty"`
+	// LastServedAt is when the account, plan or key last answered a
+	// request through the gateway, nil when it hasn't in the last 30 days
+	// (served.go); Last is on the latest of them (#570).
+	LastServedAt *time.Time `json:"lastServedAt,omitempty"`
+	Last         bool       `json:"last,omitempty"`
+	// From is the remote magpie whose account this is, by its name here
+	// (remote_quotas.go); "" for this computer's own.
+	From string `json:"from,omitempty"`
+	// Alias is the account's name of the user's own, else Seat: the name
+	// of the key plan whose card this account's stands in for (#1515).
+	Alias string `json:"alias,omitempty"`
+	Seat  string `json:"seat,omitempty"`
 }
 
 // QuotaSpan is one window of an allowance: how much of it is used and
 // left, in percent, and when it starts again.
 type QuotaSpan struct {
+	Unlimited bool       `json:"unlimited,omitempty"`
 	Name      string     `json:"name"`
 	Used      float64    `json:"used"`
 	Remaining float64    `json:"remaining"`
 	ResetsAt  *time.Time `json:"resetsAt,omitempty"`
 	Display   string     `json:"display,omitempty"` // the vendor's own count, "1.2k / 3k"
+	// Amount of Limit in Unit: the window's count, used, when the vendor
+	// counts it so ("credits")
+	Amount float64 `json:"amount,omitempty"`
+	Limit  float64 `json:"limit,omitempty"`
+	Unit   string  `json:"unit,omitempty"`
+	Pool   string  `json:"pool,omitempty"` // the shared pool the window draws on ("Gemini")
 }
 
 // QuotaReport is Quotas as Quota, the reset times made absolute from now.
 func QuotaReport(ctx context.Context, now time.Time) []Quota {
 	subs, plans, balances := quotas(ctx)
+	return withServed(quotaReport(subs, plans, balances, now), LastServed())
+}
+
+// quotaReport assembles the cards from readings the tests feed directly.
+func quotaReport(subs, plans, balances []SubscriptionQuota, now time.Time) []Quota {
 	out := []Quota{}
 	for _, g := range []struct {
 		kind string
 		qs   []SubscriptionQuota
 	}{{"subscription", subs}, {"plan", plans}, {"balance", balances}} {
 		for _, q := range g.qs {
-			r := Quota{Provider: q.Provider, Name: q.Name, Kind: g.kind, Plan: q.Plan, User: q.User,
-				Windows: []QuotaSpan{}, Balance: q.Balance, Error: q.Error, Until: q.Until, Renew: q.Renew, Resets: q.Resets}
-			for _, w := range q.Windows {
-				s := QuotaSpan{Name: w.Name, Used: w.Used, Remaining: max(0, 100-w.Used), ResetsAt: w.ResetsAt, Display: w.Display}
+			r := Quota{Provider: q.Provider, Name: q.Name, Kind: g.kind, Plan: q.Plan, User: q.User, AsOf: q.AsOf, ReadAt: q.ReadAt,
+				Windows: []QuotaSpan{}, Balance: q.Balance, Error: q.Error, Until: q.Until, Renew: q.Renew, Resets: q.Resets, From: q.From, Alias: q.Alias, Seat: q.Seat}
+			// a pool's own windows stand in for the models' drawing on it,
+			// as the usage page shows them
+			for _, w := range PooledWindows(q.Windows) {
+				s := QuotaSpan{Unlimited: w.Unlimited, Name: w.Name, Used: w.Used, Remaining: max(0, 100-w.Used), ResetsAt: w.ResetsAt, Display: w.Display,
+					Amount: w.Amount, Limit: w.Limit, Unit: w.Unit, Pool: w.Pool}
 				if s.ResetsAt == nil && w.ResetSecs > 0 {
 					t := now.Add(time.Duration(w.ResetSecs) * time.Second)
 					s.ResetsAt = &t

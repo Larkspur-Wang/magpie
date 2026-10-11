@@ -1,5 +1,14 @@
 package provider
 
+// PLUGIN-SERVED (see AGENTS.md): Devin ("devin") is a deprecated built-in
+// subscription served by its plugin, @magpie-community/opencode-devin-auth,
+// once moved onto it (provider.Moved; the default for a new sign-in). A
+// moved one's sign-ins, models, requests and usage are all the plugin's,
+// never this code's (only the move, in migrate*.go, still reads its
+// accounts). A fix here alone doesn't reach those users; fix the plugin
+// (github.com/magpie-community/plugins, packages/devin) and raise the
+// mover's min in internal/provider/migrate_side.go.
+
 // A Devin subscription is served through the API the devin CLI talks to
 // (gateway/devin.go), with the key the CLI signed in with; here is who that
 // account is, the models it offers, and the sign-in, which is `devin auth
@@ -22,7 +31,10 @@ import (
 
 	toml "github.com/pelletier/go-toml/v2"
 
+	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/proc"
+	"github.com/yetone/magpie/internal/settings"
 )
 
 // DevinExecutable finds the devin CLI; a var so tests can fake it.
@@ -31,7 +43,7 @@ var DevinExecutable = func() string {
 		return p
 	}
 	home, _ := os.UserHomeDir()
-	for _, p := range []string{filepath.Join(home, ".local", "bin", "devin"), "/usr/local/bin/devin", "/opt/homebrew/bin/devin"} {
+	for _, p := range append([]string{filepath.Join(home, ".local", "bin", "devin")}, proc.SystemDirs("/usr/local/bin/devin", "/opt/homebrew/bin/devin")...) {
 		if st, err := os.Stat(p); err == nil && !st.IsDir() {
 			return p
 		}
@@ -42,11 +54,11 @@ var DevinExecutable = func() string {
 // DevinCredentialsPath is where the CLI keeps its sign-in.
 func DevinCredentialsPath() string {
 	if runtime.GOOS == "windows" {
-		if app := os.Getenv("APPDATA"); app != "" {
+		if app := appdir.Getenv("APPDATA"); app != "" {
 			return filepath.Join(app, "devin", "credentials.toml")
 		}
 	}
-	base := os.Getenv("XDG_DATA_HOME")
+	base := appdir.Getenv("XDG_DATA_HOME")
 	if base == "" {
 		home, _ := os.UserHomeDir()
 		base = filepath.Join(home, ".local", "share")
@@ -57,7 +69,12 @@ func DevinCredentialsPath() string {
 var devinStatus = &cliIdentity{name: "devin", exe: func() string { return DevinExecutable() }, ask: askDevinStatus}
 
 // devinIdentity is who Devin's CLI says is signed in; see cliIdentity.
-func devinIdentity() (user, plan string, ok bool) { return devinStatus.get() }
+func devinIdentity() (user, plan string, ok bool) {
+	if settings.AccountDiscoveryOff() {
+		return "", "", false
+	}
+	return devinStatus.get()
+}
 
 func forgetDevinStatus() { devinStatus.forget() }
 
@@ -71,29 +88,29 @@ const devinIdentityTimeout = 30 * time.Second
 // and the account stays as it was (#154): only a CLI that says nobody is,
 // whose account's token was refused, or that keeps no credentials.toml, is
 // sure of nobody.
-func askDevinStatus() (user, plan string, ok bool, err error) { return askDevinStatusAt("") }
+func askDevinStatus() (user, plan string, ok bool, err error) {
+	return askDevinStatusAt(context.Background(), "")
+}
 
-// askDevinIdentity is who the CLI says is signed in, sure or not: the
-// sign-in has just written the credentials and has to name the account.
-func askDevinIdentity() (user, plan string, ok bool) {
-	u, p, ok, _ := askDevinStatusAt("")
+// askDevinIdentityAt is who the CLI says is signed in in home ("" for its
+// own), sure or not: a sign-in has just written the credentials and has to
+// name the account.
+func askDevinIdentityAt(ctx context.Context, home string) (user, plan string, ok bool) {
+	u, p, ok, _ := askDevinStatusAt(ctx, home)
 	return u, p, ok
 }
 
-// askDevinIdentityAt is askDevinIdentity for the account signed in in home
-// ("" for the CLI's own).
-func askDevinIdentityAt(home string) (user, plan string, ok bool) {
-	u, p, ok, _ := askDevinStatusAt(home)
-	return u, p, ok
-}
-
-// askDevinStatusAt asks the CLI who is signed in in home ("" for its own).
-func askDevinStatusAt(home string) (user, plan string, ok bool, err error) {
+// askDevinStatusAt asks the CLI who is signed in in home ("" for its own),
+// through the proxy ctx names, else the account's (devinCommand).
+func askDevinStatusAt(ctx context.Context, home string) (user, plan string, ok bool, err error) {
+	if settings.AccountDiscoveryOff() {
+		return "", "", false, nil
+	}
 	path := DevinExecutable()
 	if path == "" {
 		return "", "", false, nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), devinIdentityTimeout)
+	ctx, cancel := context.WithTimeout(ctx, devinIdentityTimeout)
 	defer cancel()
 	out, err := devinCommand(ctx, home, path, "auth", "status").Output()
 	user, plan, _ = parseDevinStatus(string(out))
@@ -235,14 +252,16 @@ func devinModelsFlatten(families []DevinFamily) []catalog.Model {
 		if most == 0 {
 			most = catalog.OutputOf(f.UID)
 		}
-		out = append(out, catalog.Model{ID: f.UID, Name: f.Label, Provider: "devin", Context: window, Output: most})
+		// Devin's word on images, as its variants all say it (#417)
+		images := f.images()
+		out = append(out, catalog.Model{ID: f.UID, Name: f.Label, Provider: "devin", Context: window, Output: most, ImageInput: images})
 		// the family's fast run, one model for its fast variants as the
 		// family's id is for the rest; not an id of Devin's, the gateway
 		// asks for the variant at the effort (DevinVariant). One a family
 		// of that name already is (swe-1.6-fast) isn't made up.
 		for _, t := range f.tiers() {
 			if id := f.UID + "-" + t; !slices.ContainsFunc(families, func(g DevinFamily) bool { return g.named(id) }) {
-				out = append(out, catalog.Model{ID: id, Name: f.Label + " " + devinTierLabel(t), Provider: "devin", Context: window, Output: most})
+				out = append(out, catalog.Model{ID: id, Name: f.Label + " " + devinTierLabel(t), Provider: "devin", Context: window, Output: most, ImageInput: images})
 			}
 		}
 		for _, m := range f.Models {
@@ -313,6 +332,30 @@ func devinDeclared() map[string][2]int {
 	return out
 }
 
+// devinDeclaredImages is what Devin said of each model id's images, as
+// devinModelsFlatten gives it, for a list saved before Devin was asked.
+func devinDeclaredImages() map[string]*bool {
+	out := map[string]*bool{}
+	for _, f := range devinCached() {
+		if v := f.images(); v != nil {
+			for _, id := range append([]string{f.UID}, f.Aliases...) {
+				out[id] = v
+			}
+			for _, t := range f.tiers() {
+				if _, ok := out[f.UID+"-"+t]; !ok {
+					out[f.UID+"-"+t] = v
+				}
+			}
+		}
+		for _, m := range f.Models {
+			if m.ImageInput != nil {
+				out[m.ID] = m.ImageInput
+			}
+		}
+	}
+	return out
+}
+
 var devinEffort = regexp.MustCompile(`-(none|min|minimal|low|medium|high|xhigh|max|fast|priority)$`)
 
 // devinKnown is models.dev's window and reply cap for a model id, with the
@@ -338,8 +381,12 @@ func devinKnown(id string) (window, most int) {
 // has claude-opus-5-5's).
 func withDevinContexts(ms []catalog.Model) []catalog.Model {
 	declared := devinDeclared()
+	images := devinDeclaredImages()
 	out := slices.Clone(ms)
 	for i, m := range out {
+		if m.ImageInput == nil {
+			out[i].ImageInput = images[m.ID]
+		}
 		// Devin's own numbers, over what an older magpie took from models.dev
 		window, most := declared[m.ID][0], declared[m.ID][1]
 		if window > 0 {
@@ -520,7 +567,8 @@ func askDevinFamiliesAt(ctx context.Context, home string) ([]DevinFamily, error)
 	if len(families) == 0 {
 		return nil, errors.New("devin models list: no models")
 	}
-	return families, nil
+	// which take images, which the list doesn't say
+	return withDevinImages(families, devinImagesAt(ctx, home)), nil
 }
 
 // parseDevinModels reads `devin models list --format json`:
@@ -613,7 +661,7 @@ func devinExchange(ctx context.Context, code, verifier, redirect string) (savedL
 			removeDevinHome(home)
 			return savedLogin{}, err
 		}
-		user, plan, err := addDevinLogin(home)
+		user, plan, err := addDevinLogin(ctx, home)
 		if err != nil {
 			removeDevinHome(home)
 			return savedLogin{}, err
@@ -628,7 +676,7 @@ func devinExchange(ctx context.Context, code, verifier, redirect string) (savedL
 	}
 	forgetDevinStatus()
 	forgetAccountCaches()
-	user, plan, ok := askDevinIdentity()
+	user, plan, ok := askDevinIdentityAt(ctx, "")
 	if !ok {
 		// the account is only ever seen through the CLI: without it
 		// answering, magpie has nothing to show and nothing to run
@@ -676,7 +724,7 @@ func DevinAuth() (key, server string, err error) { return DevinAuthAt("") }
 // CLI's own.
 func DevinAuthAt(home string) (key, server string, err error) {
 	path := devinCredentialsAt(home)
-	b, err := os.ReadFile(path)
+	b, err := readAccountFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			if home != "" {
@@ -868,6 +916,35 @@ func devinTierOf(id string) (tier, level string) {
 		}
 	}
 	return "", devinLevel(id)
+}
+
+// devinBase is the model a Devin variant id is a variant of: the id less
+// its tier and effort words (claude-opus-5-5-low-fast is claude-opus-5-5,
+// swe-2-high swe-2); an id at no effort is itself.
+func devinBase(id string) string {
+	tier, level := devinTierOf(id)
+	if level == "" {
+		return id
+	}
+	low := strings.ToLower(id)
+	cut := func(word string) bool {
+		for _, sep := range []string{"-", "_"} {
+			if strings.HasSuffix(low, sep+word) {
+				low, id = low[:len(low)-len(sep+word)], id[:len(low)-len(sep+word)]
+				return true
+			}
+		}
+		return false
+	}
+	if tier != "" {
+		cut(tier)
+	}
+	for _, l := range devinLevels {
+		if l.level == level && cut(l.word) {
+			break
+		}
+	}
+	return id
 }
 
 // devinEffortOf is the effort a Devin id runs at, in a tier or not.

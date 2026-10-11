@@ -12,12 +12,14 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/yetone/magpie/internal/source"
 )
 
 // ---- which skills GitHub has changed --------------------------------------
@@ -39,6 +41,24 @@ type SkillCheck struct {
 	// folder's history when which that was isn't known
 	URL   string `json:"url,omitempty"`
 	Error string `json:"error,omitempty"`
+	// Limited is set when it couldn't be told because GitHub's rate limit
+	// was used up, for the page to say so in its own words
+	Limited *Limited `json:"limited,omitempty"`
+}
+
+// Limited is GitHub's rate limit used up: until when (RFC 3339, "" when
+// GitHub didn't say), and whether the requests carried a GitHub token.
+type Limited struct {
+	Until string `json:"until,omitempty"`
+	Token bool   `json:"token,omitempty"`
+}
+
+func (e errLimited) view() *Limited {
+	l := &Limited{Token: e.token}
+	if !e.until.IsZero() {
+		l.Until = e.until.UTC().Format(time.RFC3339)
+	}
+	return l
 }
 
 // The last check's findings stay for the page until a skill is updated,
@@ -64,6 +84,25 @@ func forgetCheck(name string) {
 	checks.Unlock()
 }
 
+// checkedAt is when the skills were last checked for updates (unix
+// nanoseconds), 0 before the first check since magpie started.
+var checkedAt atomic.Int64
+
+// checkEvery is how long the Library page goes before it checks for
+// updates by itself, as it opens the skills (#1449).
+const checkEvery = 12 * time.Hour
+
+// checkDue is whether the page should check the library's skills from
+// GitHub for updates: none checked since magpie started, or not for
+// checkEvery.
+func checkDue(l *Library) bool {
+	if !slices.ContainsFunc(l.Skills, func(s *Skill) bool { return s.Source != nil && s.Source.Kind == "github" }) {
+		return false
+	}
+	at := checkedAt.Load()
+	return at == 0 || time.Since(time.Unix(0, at)) >= checkEvery
+}
+
 // commit is one commit as GitHub's API lists it.
 type commit struct {
 	SHA    string `json:"sha"`
@@ -76,18 +115,9 @@ type commit struct {
 	} `json:"commit"`
 }
 
-// errLimited is GitHub turning requests away for a while: the API allows
-// an address 60 an hour without a token.
-type errLimited struct{ until time.Time }
-
-func (e errLimited) Error() string {
-	if e.until.IsZero() {
-		return "GitHub is limiting requests from here; try again in a while"
-	}
-	return "GitHub is limiting requests from here until " + e.until.Local().Format("15:04")
-}
-
 // lastCommit is the last commit to touch a folder of a repository on a ref.
+// It asks with the ETag of the answer it had before, if any: GitHub's 304
+// for an unchanged one doesn't count against the rate limit.
 func lastCommit(src Source) (*commit, error) {
 	q := url.Values{"per_page": {"1"}}
 	if src.Path != "" {
@@ -96,31 +126,26 @@ func lastCommit(src Source) (*commit, error) {
 	if src.Ref != "" {
 		q.Set("sha", src.Ref)
 	}
-	req, _ := http.NewRequest("GET", githubAPI+"/repos/"+src.Repo+"/commits?"+q.Encode(), nil)
-	req.Header.Set("User-Agent", "magpie")
-	req.Header.Set("Accept", "application/vnd.github+json")
-	c := &http.Client{Timeout: 20 * time.Second}
-	resp, err := c.Do(req)
+	u := githubAPI + "/repos/" + src.Repo + "/commits?" + q.Encode()
+	body, code, token, err := apiGet(u)
 	if err != nil {
-		return nil, fmt.Errorf("couldn't reach GitHub: %w", err)
+		return nil, err
 	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	switch {
-	case resp.StatusCode == 429,
-		resp.StatusCode == 403 && (resp.Header.Get("X-RateLimit-Remaining") == "0" || strings.Contains(strings.ToLower(string(body)), "rate limit")):
-		var e errLimited
-		if n, err := strconv.ParseInt(resp.Header.Get("X-RateLimit-Reset"), 10, 64); err == nil && n > 0 {
-			e.until = time.Unix(n, 0)
+	case code == 401 && token:
+		_, from := GitHubToken()
+		where := "the GitHub token in Settings → Network and sharing"
+		if from != "settings" {
+			where = from + " (no GitHub token is set in Settings → Network and sharing)"
 		}
-		return nil, e
-	case resp.StatusCode == 404, resp.StatusCode == 422:
+		return nil, fmt.Errorf("GitHub refused %s: it may have expired or been revoked", where)
+	case code == 404, code == 422:
 		if src.Ref != "" {
 			return nil, fmt.Errorf("GitHub has no %s at %s any more", src.Repo, src.Ref)
 		}
 		return nil, fmt.Errorf("GitHub has no repository %s any more", src.Repo)
-	case resp.StatusCode != 200:
-		return nil, fmt.Errorf("GitHub answered %s", resp.Status)
+	case code != 200:
+		return nil, fmt.Errorf("GitHub answered %d %s", code, http.StatusText(code))
 	}
 	var list []commit
 	if err := json.Unmarshal(body, &list); err != nil {
@@ -132,10 +157,60 @@ func lastCommit(src Source) (*commit, error) {
 	return &list[0], nil
 }
 
+// apiGet asks GitHub's API for u, with the ETag of the answer it had
+// before, if any: GitHub's 304 for an unchanged one doesn't count against
+// the rate limit, and is answered as the 200 it had. It says whether the
+// request carried a GitHub token, and a rate limit used up is an
+// errLimited.
+func apiGet(u string) ([]byte, int, bool, error) {
+	req, _ := http.NewRequest("GET", u, nil)
+	req.Header.Set("User-Agent", "magpie")
+	req.Header.Set("Accept", "application/vnd.github+json")
+	token := withGitHubToken(req)
+	etags.Lock()
+	had, cached := etags.m[u]
+	etags.Unlock()
+	if cached {
+		req.Header.Set("If-None-Match", had.etag)
+	}
+	c := &http.Client{Timeout: 20 * time.Second}
+	resp, err := source.Do(c, req)
+	if err != nil {
+		return nil, 0, token, fmt.Errorf("couldn't reach GitHub: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if e, ok := limitedBy(resp, body, token); ok {
+		return nil, resp.StatusCode, token, e
+	}
+	if resp.StatusCode == 304 && cached {
+		return had.body, 200, token, nil
+	}
+	if et := resp.Header.Get("ETag"); resp.StatusCode == 200 && et != "" {
+		etags.Lock()
+		etags.m[u] = etagged{etag: et, body: body}
+		etags.Unlock()
+	}
+	return body, resp.StatusCode, token, nil
+}
+
 // hashDir is a hash of a skill's files, their names and what's in them,
 // as copyDir copies them.
-func hashDir(dir string) string {
+func hashDir(dir string) string { return hashFiles(dir, false) }
+
+// hashFiles is hashDir, leaving aside the .DS_Store files Finder leaves in
+// a folder it shows when noFinder is set. A folder unchanged since it was
+// last hashed isn't read again (treememo.go).
+func hashFiles(dir string, noFinder bool) string {
+	return rememberedHash(dir, noFinder)
+}
+
+// hashWalk walks dir as hashFiles reads it, stamping each file and link
+// it would hash (treememo.go); with read, it also hashes their bytes. ok
+// is false when it can't be walked, or a file can't be read.
+func hashWalk(dir string, noFinder, read bool) (hash, stamp string, settled, ok bool) {
 	h := sha256.New()
+	st := newStamper()
 	err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -148,15 +223,30 @@ func hashDir(dir string) string {
 				return filepath.SkipDir
 			}
 		case d.Type()&fs.ModeSymlink != 0:
-			t, _ := os.Readlink(p)
-			fmt.Fprintf(h, "link %s %s\n", rel, filepath.ToSlash(t))
-		case d.Type().IsRegular() && rel != marker:
+			fi, err := d.Info()
+			if err != nil {
+				return err
+			}
+			st.add(rel, fi)
+			if read {
+				t, _ := os.Readlink(p)
+				fmt.Fprintf(h, "link %s %s\n", rel, filepath.ToSlash(t))
+			}
+		case d.Type().IsRegular() && rel != marker && !(noFinder && d.Name() == ".DS_Store"):
+			fi, err := d.Info()
+			if err != nil {
+				return err
+			}
+			st.add(rel, fi)
+			if !read {
+				return nil
+			}
 			f, err := os.Open(p)
 			if err != nil {
 				return err
 			}
 			defer f.Close()
-			fi, _ := f.Stat()
+			fi, _ = f.Stat()
 			fmt.Fprintf(h, "file %s %d\n", rel, fi.Size())
 			if _, err := io.Copy(h, f); err != nil {
 				return err
@@ -165,9 +255,13 @@ func hashDir(dir string) string {
 		return nil
 	})
 	if err != nil {
-		return ""
+		return "", "", false, false
 	}
-	return hex.EncodeToString(h.Sum(nil))
+	stamp, settled = st.done()
+	if read {
+		hash = hex.EncodeToString(h.Sum(nil))
+	}
+	return hash, stamp, settled, true
 }
 
 func firstLine(s string) string {
@@ -216,6 +310,7 @@ func CheckSkills() ([]SkillCheck, error) {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			asked := map[string]*commit{} // a repository's skills in one folder are asked about once
+			refs := []string{}
 			for _, s := range skills {
 				c, sha, hash := checkSkill(s, f, asked, &limited)
 				omu.Lock()
@@ -224,6 +319,17 @@ func CheckSkills() ([]SkillCheck, error) {
 					known[s.Name] = [2]string{sha, hash}
 				}
 				omu.Unlock()
+				if !slices.Contains(refs, s.Source.Ref) {
+					refs = append(refs, s.Source.Ref)
+				}
+			}
+			// and what the repository has added beside them since
+			for _, ref := range refs {
+				if found, ok := findNew(l, skills[0].Source.Repo, ref, f, &limited); ok {
+					newFound.Lock()
+					newFound.m[repoKey(skills[0].Source.Repo, ref)] = found
+					newFound.Unlock()
+				}
 			}
 		}()
 	}
@@ -249,6 +355,7 @@ func CheckSkills() ([]SkillCheck, error) {
 		checks.m[c.Name] = c
 	}
 	checks.Unlock()
+	checkedAt.Store(time.Now().UnixNano())
 	if out == nil {
 		out = []SkillCheck{}
 	}
@@ -265,7 +372,7 @@ func checkSkill(s *Skill, f *fetcher, asked map[string]*commit, limited *atomic.
 	last := asked[key]
 	if last == nil {
 		if e := limited.Load(); e != nil {
-			c.Error = e.Error()
+			c.Error, c.Limited = e.Error(), e.view()
 			return c, "", ""
 		}
 		var err error
@@ -274,6 +381,7 @@ func checkSkill(s *Skill, f *fetcher, asked map[string]*commit, limited *atomic.
 			var e errLimited
 			if errors.As(err, &e) {
 				limited.Store(&e)
+				c.Limited = e.view()
 			}
 			c.Error = err.Error()
 			return c, "", ""

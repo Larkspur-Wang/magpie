@@ -1,10 +1,16 @@
 package provider
 
 // A rule as it is typed: use=<model> tokens=200k images effort=high
-// agents=a,b intent="…" compact — by magpie group rule and the TUI's routing page.
+// agents=a,b intent="…" compact time=09:00-18:00 days=mon-fri
+// folders=~/work,"~/My Project" except-folders=~/work/old, or
+// pause=<model> time=… days=… agents=… folders=… except-folders=… — by
+// magpie group rule and the
+// TUI's routing page.
 
 import (
 	"fmt"
+	"math"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -20,10 +26,58 @@ func ParseTokens(v string) (int, error) {
 		mul, s = 1e6, strings.TrimSuffix(s, "m")
 	}
 	f, err := strconv.ParseFloat(s, 64)
-	if err != nil || f < 0 {
+	if err != nil || f < 0 || math.IsNaN(f) || math.IsInf(f, 0) {
 		return 0, fmt.Errorf("tokens %q is not a length (200000, 200k, 1m)", v)
 	}
-	return int(f * mul), nil
+	n := f * mul
+	if n >= float64(math.MaxInt) {
+		return 0, fmt.Errorf("tokens %q is not a length (200000, 200k, 1m)", v)
+	}
+	return int(n), nil
+}
+
+// ParseDays reads days of the week: "mon-fri", "sat,sun", "mon,wed-fri";
+// a range may run past Sunday (fri-mon).
+func ParseDays(v string) ([]string, error) {
+	var out []string
+	for _, part := range strings.FieldsFunc(v, func(r rune) bool { return r == ',' || r == ' ' }) {
+		a, b, isRange := strings.Cut(strings.ReplaceAll(part, "–", "-"), "-")
+		from, ok := ParseDay(a)
+		if !ok {
+			return nil, fmt.Errorf("days: %q is not a day of the week (mon … sun)", a)
+		}
+		to := from
+		if isRange {
+			if to, ok = ParseDay(b); !ok {
+				return nil, fmt.Errorf("days: %q is not a day of the week (mon … sun)", b)
+			}
+		}
+		for i := slices.Index(Weekdays, from); ; i = (i + 1) % 7 {
+			if !slices.Contains(out, Weekdays[i]) {
+				out = append(out, Weekdays[i])
+			}
+			if Weekdays[i] == to {
+				break
+			}
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("days names the days of the week it holds on: days=mon-fri")
+	}
+	return out, nil
+}
+
+// ParseTimeWindow reads hours of the day: 09:00-18:00, 22:00-08:00.
+func ParseTimeWindow(v string) (*TimeWindow, error) {
+	from, to, ok := strings.Cut(strings.ReplaceAll(strings.TrimSpace(v), "–", "-"), "-")
+	if !ok {
+		return nil, fmt.Errorf("time is hours of the day, local time: time=09:00-18:00 (or 22:00-08:00, past midnight), not %q", v)
+	}
+	w := &TimeWindow{From: strings.TrimSpace(from), To: strings.TrimSpace(to)}
+	if err := w.clean(); err != nil {
+		return nil, err
+	}
+	return w, nil
 }
 
 // UnknownRuleWord starts the error for a word ParseRule doesn't know.
@@ -43,6 +97,12 @@ func ParseRule(g Group, words []string) (r Rule, at int, classifier string, err 
 				return r, 0, "", err
 			}
 			r.Use = id
+		case "pause", "skip":
+			id, err := GroupMember(g, v)
+			if err != nil {
+				return r, 0, "", err
+			}
+			r.Use, r.Pause = id, true
 		case "tokens", "context", "longer":
 			n, err := ParseTokens(v)
 			if err != nil {
@@ -79,6 +139,42 @@ func ParseRule(g Group, words []string) (r Rule, at int, classifier string, err 
 			if r.Intent == "" {
 				return r, 0, "", fmt.Errorf(`intent says what the message asks for: intent="writing or fixing tests"`)
 			}
+		case "time", "hours", "between":
+			w, err := ParseTimeWindow(v)
+			if err != nil {
+				return r, 0, "", err
+			}
+			if r.Time != nil {
+				w.Days = r.Time.Days
+			}
+			r.Time = w
+		case "days", "day":
+			days, err := ParseDays(v)
+			if err != nil {
+				return r, 0, "", err
+			}
+			if r.Time == nil {
+				r.Time = &TimeWindow{From: "00:00", To: "00:00"} // the whole day, unless time= says
+			}
+			r.Time.Days = days
+		case "folders", "folder", "in", "project", "projects":
+			fs, err := parseFolders(v)
+			if err != nil {
+				return r, 0, "", err
+			}
+			if len(fs) == 0 {
+				return r, 0, "", fmt.Errorf("folders names the working folders it holds in: folders=~/work/acme,~/oss")
+			}
+			r.Folders = append(r.Folders, fs...)
+		case "except-folders", "except-folder", "exceptfolders", "not-in", "outside":
+			fs, err := parseFolders(v)
+			if err != nil {
+				return r, 0, "", err
+			}
+			if len(fs) == 0 {
+				return r, 0, "", fmt.Errorf("except-folders names the working folders it doesn't hold in: except-folders=~/big-task")
+			}
+			r.ExceptFolders = append(r.ExceptFolders, fs...)
 		case "classifier", "classify", "by":
 			if classifier = strings.TrimSpace(v); classifier == "" {
 				return r, 0, "", fmt.Errorf("classifier=<model>: the model that tells which intent a message is")
@@ -90,11 +186,17 @@ func ParseRule(g Group, words []string) (r Rule, at int, classifier string, err 
 			}
 			at = n
 		default:
-			return r, 0, "", fmt.Errorf(UnknownRuleWord+"%q (use, tokens, images, effort, agents, intent, compact, classifier, at)", w)
+			return r, 0, "", fmt.Errorf(UnknownRuleWord+"%q (use, pause, tokens, images, effort, agents, intent, compact, time, days, folders, except-folders, classifier, at)", w)
 		}
 	}
 	if r.Use == "" {
-		return r, 0, "", fmt.Errorf("use=<model> is missing: one of %s", strings.Join(g.Members, ", "))
+		return r, 0, "", fmt.Errorf("use=<model> (or pause=<model>) is missing: one of %s", strings.Join(g.Members, ", "))
+	}
+	if r.Pause && (r.Tokens > 0 || r.Images || r.Effort != "" || r.Intent != "" || r.Compact) {
+		return r, 0, "", fmt.Errorf("pause=<model> holds by time=, days=, agents=, folders= or except-folders= only")
+	}
+	if r.Pause && r.Time == nil && len(r.Agents) == 0 && !r.ByFolder() {
+		return r, 0, "", fmt.Errorf("pause=<model> needs time=, days=, agents=, folders= or except-folders=: when the model is left out")
 	}
 	if r.Intent != "" && classifier == "" && g.Classifier == "" {
 		return r, 0, "", fmt.Errorf("a rule with an intent needs the group's classifier, the model that tells which intent a message is: add classifier=<model>, best a small fast one")
@@ -165,6 +267,9 @@ func RuleWords(line string) []string {
 // Line is the rule as ParseRule reads it back.
 func (r Rule) Line() string {
 	out := []string{"use=" + r.Use}
+	if r.Pause {
+		out[0] = "pause=" + r.Use
+	}
 	if r.Tokens > 0 {
 		out = append(out, fmt.Sprintf("tokens=%d", r.Tokens))
 	}
@@ -183,5 +288,41 @@ func (r Rule) Line() string {
 	if r.Compact {
 		out = append(out, "compact")
 	}
+	if r.Time != nil {
+		if r.Time.From != r.Time.To || len(r.Time.Days) == 0 {
+			out = append(out, "time="+r.Time.From+"-"+r.Time.To)
+		}
+		if len(r.Time.Days) > 0 {
+			out = append(out, "days="+strings.ReplaceAll(strings.ToLower(r.Time.DaysText()), "–", "-"))
+		}
+	}
+	folders := func(k string, fs []string) {
+		if len(fs) == 0 {
+			return
+		}
+		v := strings.ReplaceAll(strings.Join(fs, ","), `"`, "")
+		if strings.ContainsAny(v, " \t") {
+			v = `"` + v + `"`
+		}
+		out = append(out, k+"="+v)
+	}
+	folders("folders", r.Folders)
+	folders("except-folders", r.ExceptFolders)
 	return strings.Join(out, " ")
+}
+
+// parseFolders reads a typed list of folders, comma separated.
+func parseFolders(v string) ([]string, error) {
+	var out []string
+	for _, p := range strings.Split(v, ",") {
+		if p = strings.TrimSpace(p); p == "" {
+			continue
+		}
+		c, err := cleanFolder(p)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, nil
 }

@@ -8,10 +8,12 @@ package provider
 // Nothing is added until the user picks.
 
 import (
+	"cmp"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"maps"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -19,6 +21,10 @@ import (
 	"strings"
 
 	"github.com/tidwall/jsonc"
+	"github.com/yetone/magpie/internal/appdir"
+	"github.com/yetone/magpie/internal/edit"
+	"github.com/yetone/magpie/internal/plugin"
+	"github.com/yetone/magpie/internal/settings"
 	_ "modernc.org/sqlite"
 )
 
@@ -45,17 +51,24 @@ type AppImport struct {
 	// this one can join it as one more key instead of being a provider
 	// of its own.
 	KeyOf string `json:"keyOf,omitempty"`
-	Off   string `json:"off,omitempty"`  // why it isn't picked by default
-	Skip  string `json:"skip,omitempty"` // why it can't be imported at all
+	// Reserved: its id is a subscription's (claude, workbuddy…), whose
+	// name it happens to have. It can't replace that subscription, only
+	// come in as a provider of its own beside it.
+	Reserved bool   `json:"reserved,omitempty"`
+	Off      string `json:"off,omitempty"`  // why it isn't picked by default
+	Skip     string `json:"skip,omitempty"` // why it can't be imported at all
 }
 
 // AppPick is one entry the user chose, and how it comes in: as a provider
 // ("add", beside any with its id), in place of the one with its id
 // ("replace"), or as one more key of the provider KeyOf names ("key").
+// Name is the name the user gave it in the picker, when its own collides
+// with one magpie has (#1487); a renamed entry is added, never replaces.
 type AppPick struct {
 	Source string `json:"source"`
 	Ref    string `json:"ref"`
 	Mode   string `json:"mode,omitempty"`
+	Name   string `json:"name,omitempty"`
 }
 
 // appReaders are the apps magpie knows, by name as the picker lists them.
@@ -112,27 +125,61 @@ func ImportFromApps(picks []AppPick) ([]string, error) {
 			continue
 		}
 		p := it.Provider
+		mode := pk.Mode
+		if name := strings.TrimSpace(pk.Name); name != "" && name != p.Name {
+			// renamed in the picker: its id follows the new name, unless it
+			// is a preset's, which keeps the preset's id
+			p.Name = name
+			if p.Preset == "" {
+				p.ID = cmp.Or(Slug(name), p.ID)
+			}
+			if mode != "key" {
+				mode = "add"
+			}
+		}
 		switch {
-		case pk.Mode == "key" && it.KeyOf != "":
-			if h, err := Find(it.KeyOf); err == nil && sameProvider(*h, p) {
+		case mode == "key" && it.KeyOf != "":
+			h, err := Find(it.KeyOf)
+			if err != nil {
+				return added, errorf("%s: %v", p.Name, err)
+			}
+			if sameProvider(*h, p) {
 				continue // picked twice, from two apps
+			}
+			// a key joins a provider only at its own address: one taken
+			// to another host would be sent there
+			if h.Account != nil || !sameProvider(Provider{Key: p.Key, Chat: h.Chat, Responses: h.Responses, Anthropic: h.Anthropic, Headers: h.Headers}, p) {
+				return added, errorf("%s: %s isn't at %s; add it as a provider of its own", p.Name, h.Name, hostOf(firstURL(p)))
 			}
 			if err := AddKey(it.KeyOf, p.Name, p.Key, ""); err != nil {
 				return added, errorf("%s: %v", p.Name, err)
 			}
-			added = append(added, p.Name)
+			added = append(added, p.Name+" ("+h.Name+")")
 			continue
-		case pk.Mode == "replace":
+		case mode == "replace" && !reservedID(p.ID):
+		case mode == "replace":
+			// a subscription is never replaced by a provider of keys: its
+			// sign-in would be lost, and Kiro's would take the key to its
+			// own host
+			return added, errorf("%s: %q is a subscription in magpie and can't be replaced; add it as a new provider", p.Name, p.ID)
 		default:
-			// the id may have been taken since, by an earlier pick
-			if h, err := Find(p.ID); err == nil {
-				if sameProvider(*h, p) {
-					continue
-				}
-				// a second one of a preset is still that preset's, under an
-				// id of its own
-				p.ID = freeID(p.ID)
+			// an account a provider holds already is not added twice: the
+			// same relay is often both a CC Switch entry and what Claude
+			// Code's settings.json points at, and both are picked at once.
+			// Two of it were added, and once one was removed the other made
+			// the entry "Already added" (#1486)
+			if holds(p) {
+				continue
 			}
+			// the id may have been taken since, by an earlier pick
+			if h, err := Find(p.ID); err == nil && sameProvider(*h, p) {
+				continue
+			}
+			// a second one of a preset is still that preset's, under an id
+			// of its own; one named as a subscription is (claude,
+			// workbuddy) takes an id of its own too, whether or not that
+			// subscription is signed in (#1487)
+			p.ID = freeID(p.ID)
 			p.Name = freeName(p.Name) // found by name too, so never two alike
 		}
 		if err := Save(p); err != nil {
@@ -143,11 +190,35 @@ func ImportFromApps(picks []AppPick) ([]string, error) {
 	return added, nil
 }
 
+// reservedID is an id no imported provider can have: the gateway's own, a
+// subscription's or a plugin's, signed in or not.
+func reservedID(id string) bool {
+	if id == "magpie" || subscriptionID(id) {
+		return true
+	}
+	_, ok := find(Accounts(), id)
+	return ok
+}
+
+// holds says a provider of magpie's has p's account: its key at its
+// address, as the import list's "same" says (settle).
+func holds(p Provider) bool {
+	for _, h := range load().Providers {
+		if !h.Hidden && sameProvider(h, p) {
+			return true
+		}
+	}
+	return false
+}
+
 // freeID is id, or id-2, id-3… whichever no provider has.
 func freeID(id string) string {
 	taken := map[string]bool{"magpie": true}
 	for _, id := range accountIDs {
 		taken[id] = true
+	}
+	for _, pp := range plugin.Cached() { // signed in or not, as a built-in's
+		taken[PluginID(pp.ID)] = true
 	}
 	for _, p := range All() {
 		taken[p.ID] = true
@@ -212,8 +283,15 @@ func settle(items []AppImport, have []Provider, used map[string]bool) []AppImpor
 				it.Existing = h.Name
 			}
 		}
-		if _, ok := find(Accounts(), p.ID); ok && it.Status == "new" {
-			it.Status, it.Existing = "taken", p.ID
+		if reservedID(p.ID) && it.Status != "same" {
+			// named as a subscription: only ever added beside it (#1487)
+			it.Status, it.Reserved = "taken", true
+			if it.Existing == "" {
+				it.Existing = p.ID
+				if h, err := Find(p.ID); err == nil {
+					it.Existing = h.Name
+				}
+			}
 		}
 	}
 	// importable first, then by name; what can't be imported goes last
@@ -285,11 +363,19 @@ func imported(name, key string, e endpoints, models []string) (Provider, string)
 		// an Azure OpenAI resource, from any app: the preset's, its
 		// endpoints on the resource's v1 API
 		p = asAzure(p)
-	} else if pr, exact := presetAt(e); pr != nil {
+	} else if pr, r, exact := presetAt(e); pr != nil {
 		p.ID, p.Icon, p.Catalog = pr.ID, pr.Icon, pr.Catalog
+		if r != nil {
+			p.Catalog = cmp.Or(r.Catalog, pr.Catalog)
+		}
 		if exact {
 			p.Preset, p.Website, p.KeysURL = pr.ID, pr.Website, pr.KeysURL
 			p.Chat, p.Responses, p.Anthropic = pr.Chat, pr.Responses, pr.Anthropic
+			if r != nil {
+				// at one of its regions: that region's endpoints and pages
+				p.atRegionOf(pr, *r)
+				p.Decide = ""
+			}
 			if n := strings.ToLower(name); n == "" || n == "default" {
 				p.Name = pr.Name
 			}
@@ -309,39 +395,72 @@ func cleanBase(u string) string {
 	return u
 }
 
-// gatewayURL is magpie's own address: importing it would loop.
+// gatewayURL is magpie's own address, on the port it listens on now or
+// the one Settings has: importing it would loop.
 func gatewayURL(u *url.URL) bool {
 	h := u.Hostname()
-	return (h == "127.0.0.1" || h == "localhost") && u.Port() == "3425"
+	if h != "127.0.0.1" && h != "localhost" {
+		return false
+	}
+	for _, a := range []string{settings.GatewayAddr(), settings.SavedAddr()} {
+		if _, p, err := net.SplitHostPort(a); err == nil && u.Port() == p {
+			return true
+		}
+	}
+	return false
 }
 
-// presetAt finds the preset serving an entry's host, and whether the entry
-// uses exactly that preset's endpoints.
-func presetAt(e endpoints) (*PresetDef, bool) {
+// presetAt finds the preset serving an entry's host, the region of it the
+// entry is at when it isn't the preset's own endpoints (Tencent Cloud's
+// TokenHub), and whether the entry uses exactly those endpoints.
+func presetAt(e endpoints) (*PresetDef, *Region, bool) {
 	given := map[string]string{"chat": e.chat, "responses": e.responses, "anthropic": e.anthropic}
-	for i := range presets {
-		pr := &presets[i]
-		if pr.Kind == KindLocal {
-			continue
-		}
-		own := map[string]string{"chat": pr.Chat, "responses": pr.Responses, "anthropic": pr.Anthropic}
-		hit, exact := false, true
+	// at endpoints own: whether the entry is at their host, and at them all
+	at := func(chat, responses, anthropic string) (hit, exact bool) {
+		own := map[string]string{"chat": chat, "responses": responses, "anthropic": anthropic}
+		exact = true
 		for k, u := range given {
 			if u == "" {
 				continue
 			}
-			if own[k] != "" && hostOf(own[k]) == hostOf(u) || hostOf(pr.Chat) == hostOf(u) || hostOf(pr.Anthropic) == hostOf(u) {
+			if own[k] != "" && hostOf(own[k]) == hostOf(u) || hostOf(chat) == hostOf(u) || hostOf(anthropic) == hostOf(u) {
 				hit = true
 			}
 			if !strings.EqualFold(own[k], u) {
 				exact = false
 			}
 		}
+		return hit, exact
+	}
+	for i := range presets {
+		pr := &presets[i]
+		if pr.Kind == KindLocal {
+			continue
+		}
+		hit, exact := at(pr.Chat, pr.Responses, pr.Anthropic)
+		if hit && exact {
+			return pr, nil, true
+		}
+		var near *Region
+		for j := range pr.Regions {
+			r := &pr.Regions[j]
+			if r.Chat == "" && r.Responses == "" && r.Anthropic == "" {
+				continue
+			}
+			if hit, exact := at(r.Chat, r.Responses, r.Anthropic); exact && hit {
+				return pr, r, true
+			} else if hit && near == nil {
+				near = r
+			}
+		}
 		if hit {
-			return pr, exact
+			return pr, nil, false
+		}
+		if near != nil {
+			return pr, near, false
 		}
 	}
-	return nil, false
+	return nil, nil, false
 }
 
 // ---- CC Switch -------------------------------------------------------------
@@ -364,11 +483,7 @@ func fileExists(p string) bool {
 }
 
 func claudeSettingsPath() string {
-	if dir := os.Getenv("CLAUDE_CONFIG_DIR"); dir != "" {
-		return filepath.Join(dir, "settings.json")
-	}
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".claude", "settings.json")
+	return filepath.Join(appdir.ClaudeDir(), "settings.json")
 }
 
 // readClaudeSettings is the relay Claude Code was pointed at in its own
@@ -381,7 +496,7 @@ func readClaudeSettings(path string) ([]AppImport, error) {
 		return nil, err
 	}
 	var s map[string]any
-	if err := json.Unmarshal(jsonc.ToJSON(raw), &s); err != nil {
+	if err := json.Unmarshal(jsonc.ToJSON(edit.TrimBOM(raw)), &s); err != nil {
 		return nil, errors.New("Claude Code's settings.json: " + err.Error())
 	}
 	env := mapOf(s["env"])
@@ -451,7 +566,7 @@ func readCCSwitch(path string) ([]AppImport, error) {
 			return nil, err
 		}
 		var cfg map[string]json.RawMessage
-		if err := json.Unmarshal(jsonc.ToJSON(raw), &cfg); err != nil {
+		if err := json.Unmarshal(jsonc.ToJSON(edit.TrimBOM(raw)), &cfg); err != nil {
 			return nil, errors.New("CC Switch's config.json: " + err.Error())
 		}
 		for app, sec := range cfg {

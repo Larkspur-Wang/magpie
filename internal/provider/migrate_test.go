@@ -4,13 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/yetone/magpie/internal/plugin"
+	"github.com/yetone/magpie/internal/testenv"
 	"github.com/yetone/magpie/internal/zed"
 )
 
@@ -76,10 +77,7 @@ func fakeSaved(t *testing.T) map[string]savedLogin {
 // Moved, the plugin has the accounts in the user's order; moved back, the
 // built-in has them again, fresh tokens and order included.
 func TestMoveToPlugin(t *testing.T) {
-	bun, err := exec.LookPath("bun")
-	if err != nil {
-		t.Skip("no bun on PATH")
-	}
+	bun := testenv.Bun(t)
 	claudeHome(t)
 	t.Setenv("MAGPIE_BUN", bun)
 	t.Cleanup(plugin.Settle)
@@ -127,7 +125,7 @@ func TestMoveToPlugin(t *testing.T) {
 	// an account the vendor refuses: nothing moves, and the other's token,
 	// spent by the plugin, comes back renewed
 	reset(fakeLogin("a@fake", "rot-a", false, true), fakeLogin("c@fake", "r-dead", false, true))
-	err = Move(ctx, "fakeco")
+	err := Move(ctx, "fakeco")
 	if err == nil || !strings.Contains(err.Error(), "c@fake") {
 		t.Fatalf("Move with a refused account = %v", err)
 	}
@@ -150,6 +148,37 @@ func TestMoveToPlugin(t *testing.T) {
 	if len(fakeSaved(t)) != 1 || plugin.SignedIn("fakeco") {
 		t.Fatal("a move short of a model moved")
 	}
+	// one the mover says the plugin serves though it doesn't list it (a
+	// Devin variant) isn't named, nor is a name twice
+	movers["fakeco"].served = func(m string, listed []string) bool { return m == "fake-1-high" && slices.Contains(listed, "fake-1") }
+	reset(fakeLogin("a@fake", "r-a", false, true))
+	inUse = []string{"fake-1", "fake-1-high", "gone-model", "gone-model"}
+	if err := Move(ctx, "fakeco"); err == nil || strings.Contains(err.Error(), "fake-1-high") || strings.Count(err.Error(), "gone-model") != 1 {
+		t.Fatalf("Move with a served variant and a model the plugin lacks = %v", err)
+	}
+	movers["fakeco"].served = nil
+	// one the built-in never served on the account either (a ZCode Start
+	// Plan account's GLM-5.3) is no loss and isn't named; one it did is,
+	// with the account and its plan
+	movers["fakeco"].builtin = func(_ context.Context, a Moving, m string) bool { return a.User != "a@fake" || m != "never-model" }
+	reset(func() savedLogin { l := fakeLogin("a@fake", "r-a", false, true); l.Plan = "Fake Start"; return l }())
+	inUse = []string{"fake-1", "never-model"}
+	if err := Move(ctx, "fakeco"); err != nil {
+		t.Fatalf("Move with a model the built-in didn't serve either = %v", err)
+	}
+	if err := MoveBack(ctx, "fakeco"); err != nil {
+		t.Fatal(err)
+	}
+	reset(func() savedLogin { l := fakeLogin("a@fake", "r-a", false, true); l.Plan = "Fake Start"; return l }())
+	inUse = []string{"fake-1", "never-model", "gone-model"}
+	err = Move(ctx, "fakeco")
+	if err == nil || strings.Contains(err.Error(), "never-model") || !strings.Contains(err.Error(), "gone-model for a@fake (Fake Start)") {
+		t.Fatalf("Move with a model the built-in served on the account = %v", err)
+	}
+	if w := WhyOf(err); w == nil || w.Code != "unserved" || w.Args["user"] != "a@fake (Fake Start)" || w.Args["models"] != "gone-model" {
+		t.Fatalf("its why: %+v", w)
+	}
+	movers["fakeco"].builtin = nil
 	inUse = []string{"fake-1", "fake-claude"}
 
 	// an account signed in through the plugin already gets back what it had
@@ -196,13 +225,15 @@ func TestMoveToPlugin(t *testing.T) {
 	}
 	// a built-in with no usage card of its own (Devin) keeps the plugin's
 	cards := 0
-	for _, q := range fetchSubscriptionUsage() {
+	qs := fetchSubscriptionUsage(context.Background())
+	for _, q := range qs {
 		if q.Provider == "fakeco" {
 			cards++
 		}
 	}
 	if cards == 0 {
-		t.Fatal("the moved plugin's accounts show no usage")
+		t.Fatalf("the moved plugin's accounts show no usage: moved %v, plugins %d, logins %d, cards %+v",
+			Moved("fakeco"), len(plugin.Cached()), len(pluginUsageLogins(mustPlugin(t))), qs)
 	}
 
 	// the user reorders on the plugin, and it renews a's token; back, the
@@ -248,10 +279,7 @@ func TestMoveToPlugin(t *testing.T) {
 // A move cut short (magpie quit mid-way) is put back before it is tried
 // again, and a failed one waits before magpie tries it by itself again.
 func TestMoveCutShort(t *testing.T) {
-	bun, err := exec.LookPath("bun")
-	if err != nil {
-		t.Skip("no bun on PATH")
-	}
+	bun := testenv.Bun(t)
 	claudeHome(t)
 	t.Setenv("MAGPIE_BUN", bun)
 	t.Cleanup(plugin.Settle)
@@ -327,10 +355,7 @@ func mustPlugin(t *testing.T) plugin.Provider {
 // when it renewed one, the built-in's when that renewed it meanwhile (a
 // request went to it), none when neither did.
 func TestPutBackKeepsNewer(t *testing.T) {
-	bun, err := exec.LookPath("bun")
-	if err != nil {
-		t.Skip("no bun on PATH")
-	}
+	bun := testenv.Bun(t)
 	claudeHome(t)
 	t.Setenv("MAGPIE_BUN", bun)
 	t.Cleanup(plugin.Settle)
@@ -389,7 +414,7 @@ func TestMovedBuiltinQuiet(t *testing.T) {
 	t.Cleanup(func() { zedCloud = zed.CloudURL })
 	cards := func() int {
 		n := 0
-		for _, q := range fetchSubscriptionUsage() {
+		for _, q := range fetchSubscriptionUsage(context.Background()) {
 			if q.Provider == "zed" {
 				n++
 			}
@@ -436,10 +461,7 @@ func TestKeepMovedCurrent(t *testing.T) {
 // the built-in back first: its accounts go back to it rather than out of
 // sight with the plugin.
 func TestReleasePlugin(t *testing.T) {
-	bun, err := exec.LookPath("bun")
-	if err != nil {
-		t.Skip("no bun on PATH")
-	}
+	bun := testenv.Bun(t)
 	for _, op := range []string{"off", "remove"} {
 		t.Run(op, func(t *testing.T) {
 			claudeHome(t)
@@ -468,6 +490,7 @@ func TestReleasePlugin(t *testing.T) {
 			if got := MovedOnto(abs); len(got) != 1 || got[0] != "fakeco" {
 				t.Fatalf("moved onto the plugin: %v", got)
 			}
+			var err error
 			if op == "off" {
 				err = SetPluginOff(ctx, abs, true)
 			} else {

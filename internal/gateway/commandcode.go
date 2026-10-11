@@ -1,5 +1,15 @@
 package gateway
 
+// PLUGIN-SERVED (see AGENTS.md): Command Code's plan ("commandcode-plan") is
+// a deprecated built-in subscription served by its plugin,
+// @magpie-community/opencode-commandcode-auth, once moved onto it
+// (provider.Moved; the default for a new sign-in). A moved one's sign-ins,
+// models, requests and usage are all the plugin's, never this code's (only
+// the move, in migrate*.go, still reads its accounts). A fix here alone
+// doesn't reach those users; fix the plugin
+// (github.com/magpie-community/plugins, packages/commandcode) and raise the
+// mover's min in internal/provider/migrate_side.go.
+
 // A Command Code account on the Go plan has no Provider API: its key is
 // only taken where the CLI itself asks, POST /alpha/generate. The request
 // is written as the CLI (command-code 1.72.2) writes it — its
@@ -64,13 +74,15 @@ func (s *Server) serveCommandCode(w http.ResponseWriter, r *http.Request, from p
 	if err != nil {
 		return writeError(w, from, 400, err.Error()), err.Error()
 	}
+	// the vendor's own API is told the answer's format in words
+	req = req.inSystem()
 	req.Model = model
 	if req.Effort != "" && !req.ThinkOff {
 		req.Effort = fitEffort(req.Effort, p.Efforts(model))
 	}
 	ask := s.askCommandCode(api, key, model)
 	if req.WebSearch && !searching(r.Context()) {
-		if _, _, ok := searcher(); ok {
+		if canSearch() {
 			return s.searchReply(w, r, from, "Command Code", req, usage, ask)
 		}
 	}
@@ -207,9 +219,12 @@ func cmdPlatform() string {
 	return runtime.GOOS
 }
 
-// cmdRequest is req as the CLI asks /alpha/generate. There is no project
-// behind a request through magpie: the config is the CLI's outside a git
-// repository (buildServerConfig), in the user's home.
+// cmdRequest is req as the CLI asks /alpha/generate, with no structure,
+// branch or status behind it (buildServerConfig). The working directory and
+// whether it is a git repository are the agent's, as its request says them
+// (workPlace), else as this computer's disk says (magpie-community/plugins
+// #86); a request that names no folder is the CLI's outside a git
+// repository, in the user's home.
 func cmdRequest(req *Request, model string) []byte {
 	tools := []cmdTool{}
 	for _, t := range req.Tools {
@@ -224,7 +239,9 @@ func cmdRequest(req *Request, model string) []byte {
 		"max_tokens": cmdMaxTokens, "stream": true,
 	}
 	if req.MaxTokens > 0 {
-		params["max_tokens"] = req.MaxTokens
+		// within what the model gives and Command Code takes: more is
+		// refused, the whole request with it
+		params["max_tokens"] = min(req.MaxTokens, provider.CommandCodeOutputOf(model))
 	}
 	if req.Temp != nil {
 		params["temperature"] = *req.Temp
@@ -232,11 +249,16 @@ func cmdRequest(req *Request, model string) []byte {
 	if req.Effort != "" && !req.ThinkOff {
 		params["reasoning_effort"] = req.Effort
 	}
-	home, _ := os.UserHomeDir()
+	dir, git := workPlace(req)
+	if dir == "" {
+		dir, _ = os.UserHomeDir()
+	} else if git == "" {
+		git = provider.GitOnDisk(dir)
+	}
 	b, _ := json.Marshal(map[string]any{
 		"config": map[string]any{
-			"workingDir": home, "date": time.Now().Format("2006-01-02"), "environment": cmdPlatform(),
-			"structure": []string{}, "isGitRepo": false, "currentBranch": "", "mainBranch": "", "gitStatus": "",
+			"workingDir": dir, "date": time.Now().Format("2006-01-02"), "environment": cmdPlatform(),
+			"structure": []string{}, "isGitRepo": git == "yes", "currentBranch": "", "mainBranch": "", "gitStatus": "",
 			"recentCommits": []string{},
 		},
 		"memory": nil, "taste": nil, "skills": nil,
@@ -272,6 +294,7 @@ func (s *Server) askCommandCode(api, key, model string) round {
 		if err != nil {
 			return nil, 502, "Command Code: " + err.Error()
 		}
+		res = notAnAPIReply(res, "") // a web page served 200 (#1012)
 		if res.StatusCode/100 != 2 {
 			b, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
 			res.Body.Close()

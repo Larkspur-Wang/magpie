@@ -1,15 +1,26 @@
 package gateway
 
 import (
+	"bufio"
+	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
+	"runtime"
+	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/testenv"
+	"github.com/yetone/magpie/internal/wslrun"
 )
 
 // autoModeAsk is Claude Code's auto mode classifier's first stage as it
@@ -140,19 +151,69 @@ func TestAutoModeClassifierAnthropicVendor(t *testing.T) {
 	}
 }
 
+// Claude Code 2.1.295's ask for the review, as it sent it in auto mode
+// (paths shortened): the beta beside its others, and the safeguards with
+// their classifier_context, an object.
+const (
+	reviewBetas = "claude-code-20250219,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24,dangerous-tool-use-2026-09-03,afk-mode-2026-01-31"
+	reviewAsked = `[{"type":"dangerous_tool_use","classifier_context":{"v":1,"permission_mode":"auto","platform":"macos","live_cwd":"/Users/lc/work","home_dir":"/Users/lc","rule_roots":{"userSettings":"/Users/lc/.claude","projectSettings":"/Users/lc/work"},"trusted_directories":{"primary":{"path":"/Users/lc/work","resolved":["/Users/lc/work"]},"additional":[],"network":[],"block_reads_outside_working_directories":false},"rules":{"allow":[],"deny":[],"ask":[]},"auto_mode":{"allow":[],"soft_deny":[],"hard_deny":[],"environment":[]},"restricted":false,"is_remote_mode":false,"user_identity":null,"git_state":{"cwd":"/Users/lc/work","root":null,"branch":null,"error":"not_a_repo"},"prior_turn_context":[{"tool_use_ids":["toolu_01Capture001"],"context":{"live_cwd":"/Users/lc/work","platform":"macos"}}]}}]`
+	// the verdict, as Claude Code 2.1.295 parses it
+	reviewed = `[{"type":"dangerous_tool_use","status":{"type":"available","tool_uses":{"toolu_01Abc":{"type":"evaluated","outcome":"not_flagged"}}}}]`
+)
+
+// reviewAsk is a turn of Claude Code's in auto mode, asking the review.
+func reviewAsk(model string) string {
+	return `{"model":"` + model + `","max_tokens":64000,"stream":true,
+	  "safeguards":` + reviewAsked + `,
+	  "tools":[{"name":"Bash","description":"Run a shell command","input_schema":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}],
+	  "messages":[{"role":"user","content":[{"type":"text","text":"Run the shell command: echo hi"}]}]}`
+}
+
+// reviewReply is a streamed call to Bash, with the review's verdict on it.
+func reviewReply(model string) string {
+	return sse(
+		`event: message_start`+"\n"+`data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"`+model+`","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":7,"output_tokens":1}}}`,
+		`event: content_block_start`+"\n"+`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_01Abc","name":"Bash","input":{}}}`,
+		`event: content_block_delta`+"\n"+`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"echo hi\"}"}}`,
+		`event: content_block_stop`+"\n"+`data: {"type":"content_block_stop","index":0}`,
+		`event: message_delta`+"\n"+`data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null,"safeguard_results":`+reviewed+`},"usage":{"output_tokens":4}}`,
+		`event: message_stop`+"\n"+`data: {"type":"message_stop"}`)
+}
+
+// askReview sends reviewAsk(model) to s as Claude Code does.
+func askReview(t *testing.T, s *Server, path, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", path, strings.NewReader(body))
+	req.Header.Set("User-Agent", "claude-cli/2.1.295 (external, sdk-cli)")
+	req.Header.Set("anthropic-beta", reviewBetas)
+	req.Header.Set("anthropic-version", "2023-06-01")
+	s.Handler().ServeHTTP(rec, req)
+	return rec
+}
+
+// reviewIn is the safeguard_results of a streamed reply's message_delta,
+// where Claude Code reads them.
+func reviewIn(t *testing.T, stream string) string {
+	t.Helper()
+	for _, e := range events(stream) {
+		if e["type"] == "message_delta" {
+			if d, _ := e["delta"].(map[string]any); d["safeguard_results"] != nil {
+				b, _ := json.Marshal(d["safeguard_results"])
+				return string(b)
+			}
+		}
+	}
+	return ""
+}
+
 // Anthropic's API reviews the actions itself when asked: the
 // dangerous-tool-use beta and the safeguards field go to it as Claude Code
-// sent them, and safeguard_results come back as it answered them. (This
-// passes on main too; it guards the classifier's changes from reaching a
-// Claude model.)
+// sent them, and safeguard_results come back as it answered them, the call's
+// id with them as it was. (This passes on main too; it guards the
+// classifier's changes from reaching a Claude model.)
 func TestAutoModeServerSideReviewRelayed(t *testing.T) {
-	f := &fake{t: t, reply: sse(
-		`event: message_start`+"\n"+`data: {"type":"message_start","message":{"id":"msg_1","model":"claude-sonnet-5","usage":{"input_tokens":7}}}`,
-		`event: content_block_start`+"\n"+`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_01Abc","name":"Bash","input":{}}}`,
-		`event: content_block_delta`+"\n"+`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"ls\"}"}}`,
-		`event: content_block_stop`+"\n"+`data: {"type":"content_block_stop","index":0}`,
-		`event: message_delta`+"\n"+`data: {"type":"message_delta","delta":{"stop_reason":"tool_use","safeguard_results":[{"type":"dangerous_tool_use","tool_uses":[{"tool_use_id":"toolu_01Abc","status":"evaluated","result":"not_flagged"}]}]},"usage":{"output_tokens":4}}`,
-		`event: message_stop`+"\n"+`data: {"type":"message_stop"}`)}
+	f := &fake{t: t, reply: reviewReply("claude-sonnet-5")}
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 	up := httptest.NewServer(f)
@@ -160,37 +221,169 @@ func TestAutoModeServerSideReviewRelayed(t *testing.T) {
 	if err := provider.Save(provider.Provider{ID: "ant", Name: "Ant", Key: "k", Anthropic: up.URL, Models: []string{"claude-sonnet-5"}}); err != nil {
 		t.Fatal(err)
 	}
-	body := `{"model":"ant/claude-sonnet-5","max_tokens":64,"stream":true,
-	  "safeguards":[{"type":"dangerous_tool_use","classifier_context":"The user allows file edits in the project."}],
-	  "tools":[{"name":"Bash","input_schema":{"type":"object"}}],
-	  "messages":[{"role":"user","content":[{"type":"text","text":"<transcript>\n"},{"type":"text","text":"list the files"}]}]}`
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest("POST", "/v1/messages?beta=true", strings.NewReader(body))
-	req.Header.Set("User-Agent", "claude-cli/2.1.285 (external, cli)")
-	req.Header.Set("anthropic-beta", "claude-code-20250219,dangerous-tool-use-2026-09-03")
-	req.Header.Set("anthropic-version", "2023-06-01")
-	New().Handler().ServeHTTP(rec, req)
+	rec := askReview(t, New(), "/v1/messages?beta=true", reviewAsk("ant/claude-sonnet-5"))
 	if rec.Code != 200 {
 		t.Fatalf("%d %s", rec.Code, rec.Body)
 	}
 	if !strings.Contains(f.head.Get("anthropic-beta"), "dangerous-tool-use-2026-09-03") {
 		t.Errorf("beta not forwarded: %q", f.head.Get("anthropic-beta"))
 	}
-	var asked map[string]any
+	var asked struct {
+		Safeguards json.RawMessage `json:"safeguards"`
+		MaxTokens  int             `json:"max_tokens"`
+	}
 	json.Unmarshal(f.got, &asked)
-	sg, _ := asked["safeguards"].([]any)
-	if len(sg) != 1 || sg[0].(map[string]any)["classifier_context"] != "The user allows file edits in the project." || asked["max_tokens"] != float64(64) {
+	if !sameReview(asked.Safeguards, []byte(reviewAsked)) || asked.MaxTokens != 64000 {
 		t.Errorf("request changed: %s", f.got)
 	}
-	var delta map[string]any
-	for _, e := range events(rec.Body.String()) {
-		if e["type"] == "message_delta" {
-			delta, _ = e["delta"].(map[string]any)
+	if got := reviewIn(t, rec.Body.String()); !sameReview([]byte(got), []byte(reviewed)) || !strings.Contains(rec.Body.String(), `"id":"toolu_01Abc"`) {
+		t.Errorf("safeguard_results not relayed: %s", rec.Body)
+	}
+}
+
+// sameReview reports whether a and b are the same JSON value.
+func sameReview(a, b []byte) bool {
+	var x, y any
+	return json.Unmarshal(a, &x) == nil && json.Unmarshal(b, &y) == nil && reflect.DeepEqual(x, y)
+}
+
+// Only Claude reviews actions: another vendor's model behind its Anthropic
+// API (DeepSeek's, Kimi's) is sent neither the beta nor the safeguards,
+// which a vendor checking what it is sent turns the request away over
+// (AiHubMix: 400 "safeguards: Extra inputs are not permitted"). Claude
+// Code, given no verdict, classifies locally. The agent's other betas go on,
+// and its count_tokens likewise goes without the beta.
+func TestAutoModeReviewOnlyForClaude(t *testing.T) {
+	f := &fake{t: t}
+	f.refuse = func(body []byte) (int, string) {
+		if strings.Contains(f.head.Get("anthropic-beta"), "dangerous-tool-use") || strings.Contains(string(body), `"safeguards"`) {
+			return 400, `{"type":"error","error":{"type":"invalid_request_error","message":"safeguards: Extra inputs are not permitted"}}`
+		}
+		return 0, ""
+	}
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	up := httptest.NewServer(f)
+	t.Cleanup(up.Close)
+	if err := provider.Save(provider.Provider{ID: "ds", Name: "DeepSeek", Key: "k", Anthropic: up.URL, Models: []string{"deepseek-flash"}}); err != nil {
+		t.Fatal(err)
+	}
+	s := New()
+	f.reply = sse(
+		`event: message_start`+"\n"+`data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"deepseek-flash","content":[],"usage":{"input_tokens":7}}}`,
+		`event: content_block_start`+"\n"+`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
+		`event: content_block_delta`+"\n"+`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}`,
+		`event: content_block_stop`+"\n"+`data: {"type":"content_block_stop","index":0}`,
+		`event: message_delta`+"\n"+`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}`,
+		`event: message_stop`+"\n"+`data: {"type":"message_stop"}`)
+	if rec := askReview(t, s, "/v1/messages?beta=true", reviewAsk("ds/deepseek-flash")); rec.Code != 200 {
+		t.Fatalf("%d %s", rec.Code, rec.Body)
+	}
+	if strings.Contains(string(f.got), `"safeguards"`) {
+		t.Errorf("safeguards sent to DeepSeek: %s", f.got)
+	}
+	beta := f.head.Get("anthropic-beta")
+	if strings.Contains(beta, "dangerous-tool-use") || !strings.Contains(beta, "claude-code-20250219") || !strings.Contains(beta, "afk-mode-2026-01-31") {
+		t.Errorf("anthropic-beta to DeepSeek: %q", beta)
+	}
+
+	f.ctype, f.reply = "application/json", `{"input_tokens":12}`
+	if rec := askReview(t, s, "/v1/messages/count_tokens?beta=true", `{"model":"ds/deepseek-flash","messages":[{"role":"user","content":"hi"}]}`); rec.Code != 200 {
+		t.Fatalf("count_tokens: %d %s", rec.Code, rec.Body)
+	}
+	if f.path != "/v1/messages/count_tokens" || strings.Contains(f.head.Get("anthropic-beta"), "dangerous-tool-use") {
+		t.Errorf("count_tokens to DeepSeek: %s %q", f.path, f.head.Get("anthropic-beta"))
+	}
+}
+
+// A provider that turned the beta away (Bedrock's runtime: Unexpected
+// value(s) for the anthropic-beta header) is asked again without it, and
+// without the safeguards it turns on, which it would turn away next.
+func TestAutoModeReviewGoesWithItsBeta(t *testing.T) {
+	f := &fake{t: t, reply: reviewReply("claude-sonnet-5")}
+	f.refuse = func(body []byte) (int, string) {
+		if strings.Contains(f.head.Get("anthropic-beta"), "dangerous-tool-use") {
+			return 400, `{"message":"Unexpected value(s) ` + "`dangerous-tool-use-2026-09-03`" + ` for the ` + "`anthropic-beta`" + ` header. Please consult our documentation at docs.anthropic.com or try again without the header."}`
+		}
+		if strings.Contains(string(body), `"safeguards"`) {
+			return 400, `{"message":"safeguards: Extra inputs are not permitted"}`
+		}
+		return 0, ""
+	}
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	up := httptest.NewServer(f)
+	t.Cleanup(up.Close)
+	if err := provider.Save(provider.Provider{ID: "ant", Name: "Ant", Key: "k", Anthropic: up.URL, Models: []string{"claude-sonnet-5"}}); err != nil {
+		t.Fatal(err)
+	}
+	s := New()
+	for i := range 2 {
+		f.calls = 0
+		rec := askReview(t, s, "/v1/messages?beta=true", reviewAsk("ant/claude-sonnet-5"))
+		if rec.Code != 200 {
+			t.Fatalf("turn %d: %d %s", i, rec.Code, rec.Body)
+		}
+		if strings.Contains(string(f.got), `"safeguards"`) || !strings.Contains(f.head.Get("anthropic-beta"), "claude-code-20250219") {
+			t.Errorf("turn %d went as %q: %s", i, f.head.Get("anthropic-beta"), f.got)
+		}
+		if i == 1 && f.calls != 1 {
+			t.Errorf("the next turn took %d requests, want 1", f.calls)
 		}
 	}
-	res, _ := delta["safeguard_results"].([]any)
-	if len(res) != 1 || !strings.Contains(rec.Body.String(), `"tool_use_id":"toolu_01Abc"`) {
-		t.Errorf("safeguard_results not relayed: %s", rec.Body)
+}
+
+// A reply its vendor gave whole goes to Claude Code, which asked a stream,
+// as the stream would have said it: the verdict in the message_delta,
+// where Claude Code reads it, not the message_start, where it finds no
+// result and leaves the review for the session.
+func TestAutoModeReviewOfAWholeReplyStreamed(t *testing.T) {
+	whole := `{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-5","content":[{"type":"tool_use","id":"toolu_01Abc","name":"Bash","input":{"command":"echo hi"}}],"stop_reason":"tool_use","stop_sequence":null,"usage":{"input_tokens":7,"output_tokens":4},"safeguard_results":` + reviewed + `}`
+	rec := httptest.NewRecorder()
+	if !wholeAsStream(rec, provider.Anthropic, []byte(whole)) {
+		t.Fatal("not a reply")
+	}
+	if got := reviewIn(t, rec.Body.String()); !sameReview([]byte(got), []byte(reviewed)) {
+		t.Errorf("verdict not in message_delta: %s", rec.Body)
+	}
+	for _, e := range events(rec.Body.String()) {
+		if m, _ := e["message"].(map[string]any); e["type"] == "message_start" && m["safeguard_results"] != nil {
+			t.Errorf("verdict in message_start: %v", e)
+		}
+	}
+}
+
+// A turn of Claude Code's translated to an Anthropic endpoint (the
+// candidates' loop, not relayed) asks Claude the review and gives Claude
+// Code its verdict; another vendor's model isn't asked it.
+func TestAutoModeReviewTranslated(t *testing.T) {
+	req, err := parseAnthropic([]byte(reviewAsk("claude-sonnet-5")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out struct {
+		Safeguards json.RawMessage `json:"safeguards"`
+	}
+	json.Unmarshal(buildAnthropic(req, "claude-sonnet-5"), &out)
+	if !sameReview(out.Safeguards, []byte(reviewAsked)) {
+		t.Errorf("safeguards to Claude: %s", out.Safeguards)
+	}
+	if b := buildAnthropic(req, "deepseek-flash"); strings.Contains(string(b), `"safeguards"`) {
+		t.Errorf("safeguards to DeepSeek: %s", b)
+	}
+
+	rec := httptest.NewRecorder()
+	enc := &anthropicEncoder{w: newSSEWriter(rec), model: "claude-sonnet-5"}
+	dec := decoder(provider.Anthropic)
+	for _, e := range events(reviewReply("claude-sonnet-5")) {
+		b, _ := json.Marshal(e)
+		if err := dec(string(b), enc.event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	enc.finish()
+	if got := reviewIn(t, rec.Body.String()); !sameReview([]byte(got), []byte(reviewed)) || !strings.Contains(rec.Body.String(), `"id":"toolu_01Abc"`) {
+		t.Errorf("verdict not given back: %s", rec.Body)
 	}
 }
 
@@ -199,6 +392,9 @@ func TestAutoModeServerSideReviewRelayed(t *testing.T) {
 // isn't kept waiting for a next turn it will never have, which would push
 // the conversations' own runs out.
 func TestAutoModeClassifierOnTheClaudeBridge(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("a shell script stands in for Claude Code")
+	}
 	dir := t.TempDir()
 	args := filepath.Join(dir, "args")
 	script := `#!/bin/sh
@@ -211,7 +407,7 @@ while read -r line; do
   echo '{"type":"result","subtype":"success","is_error":false,"result":""}'
 done
 `
-	os.WriteFile(filepath.Join(dir, "claude"), []byte(script), 0o755)
+	testenv.Program(t, filepath.Join(dir, "claude"), script)
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	s := New()
@@ -242,5 +438,278 @@ done
 		if !strings.Contains(" "+r+" ", " --effort low ") {
 			t.Errorf("run not at low effort: %s", r)
 		}
+		// thinking off as it asked: on, Claude Code thought thousands of
+		// output tokens before each 64-token verdict (0xAncientTwo)
+		if !strings.Contains(" "+r+" ", " --thinking disabled ") {
+			t.Errorf("run thinks: %s", r)
+		}
+	}
+}
+
+// The subscription bridge keeps the API's verdict opaque, including a denial,
+// skipped/unavailable calls and future fields. Missing results stay missing.
+func TestClaudeBridgeSafeguardResults(t *testing.T) {
+	for _, verdict := range []string{
+		`[{"type":"dangerous_tool_use","status":{"type":"available","tool_uses":{"toolu_client":{"type":"evaluated","outcome":"flagged","explanation":"dangerous"}}},"future":{"x":1}}]`,
+		`[{"type":"dangerous_tool_use","status":{"type":"available","tool_uses":{"toolu_client":{"type":"evaluated","outcome":"not_flagged"}}}}]`,
+		`[{"type":"dangerous_tool_use","status":{"type":"available","tool_uses":{"toolu_client":{"type":"skipped"}}}}]`,
+		`[{"type":"dangerous_tool_use","status":{"type":"unavailable","reason":"error"}}]`,
+		`[{"type":"future_check","status":{"type":"unknown"}}]`,
+		`null`,
+	} {
+		for _, whole := range []bool{false, true} {
+			name := "stream "
+			if whole {
+				name = "whole "
+			}
+			t.Run(name+verdict, func(t *testing.T) {
+				ch := make(chan Event, 16)
+				run := &subscriptionRun{segment: ch}
+				delta := map[string]any{"stop_reason": "tool_use"}
+				if verdict != "null" {
+					delta["safeguard_results"] = json.RawMessage(verdict)
+				}
+				d, _ := json.Marshal(map[string]any{"type": "stream_event", "event": map[string]any{"type": "message_delta", "delta": delta}})
+				lines := []string{
+					`{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg_client","model":"claude-sonnet-5"}}}`,
+					`{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_client","name":"mcp__magpie__Bash"}}}`,
+					string(d),
+					`{"type":"stream_event","event":{"type":"message_stop"}}`,
+				}
+				if whole {
+					message := map[string]any{"id": "msg_whole", "model": "claude-sonnet-5", "stop_reason": "tool_use",
+						"content": []any{map[string]any{"type": "tool_use", "id": "toolu_client", "name": "mcp__magpie__Bash", "input": map[string]any{}}}}
+					if verdict != "null" {
+						message["safeguard_results"] = json.RawMessage(verdict)
+					}
+					d, _ := json.Marshal(map[string]any{"type": "assistant", "message": message})
+					lines = append(append([]string{}, cutAttempt...), string(d))
+				}
+				run.readOutput(strings.NewReader(strings.Join(lines, "\n")))
+				rec := httptest.NewRecorder()
+				enc := encoder(provider.Anthropic, newSSEWriter(rec), &Request{Model: "claude-sonnet-5"})
+				var col collector
+				for e := range ch {
+					enc.event(e)
+					col.add(e)
+				}
+				enc.finish()
+				result := col.finish()
+				var response map[string]any
+				json.Unmarshal(renderAnthropic(result, "claude-sonnet-5"), &response)
+				for _, e := range events(rec.Body.String()) {
+					if e["type"] == "message_delta" {
+						delta := e["delta"].(map[string]any)
+						actual, _ := json.Marshal(delta["safeguard_results"])
+						var wantValue any
+						json.Unmarshal([]byte(verdict), &wantValue)
+						want, _ := json.Marshal(wantValue)
+						if string(actual) != string(want) {
+							t.Fatalf("stream verdict changed: %s != %s", actual, want)
+						}
+					}
+				}
+				actual, _ := json.Marshal(response["safeguard_results"])
+				var wantValue any
+				json.Unmarshal([]byte(verdict), &wantValue)
+				want, _ := json.Marshal(wantValue)
+				if string(actual) != string(want) {
+					t.Fatalf("non-stream verdict changed: %s != %s", actual, want)
+				}
+				if !strings.Contains(rec.Body.String(), `"id":"toolu_client"`) || !strings.Contains(string(renderAnthropic(result, "claude-sonnet-5")), `"id":"toolu_client"`) {
+					t.Fatal("tool ID changed")
+				}
+			})
+		}
+	}
+}
+
+// Exercise the actual subprocess/control wire: changed and removed contexts
+// reach an existing run; a rejected update restarts it with the new context.
+func TestClaudeBridgeSafeguardContextUpdates(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("a Python script stands in for Claude Code")
+	}
+	t.Setenv("TMPDIR", t.TempDir())
+	dir := t.TempDir()
+	script := `#!/usr/bin/env python3
+import json,os,sys
+body=json.loads(os.environ.get('CLAUDE_CODE_EXTRA_BODY','{}'))
+effort=sys.argv[sys.argv.index('--effort')+1] if '--effort' in sys.argv else ''
+effort_id=''
+turns=0
+def send(x): print(json.dumps(x),flush=True)
+for line in sys.stdin:
+ x=json.loads(line)
+ if x['type']=='control_request':
+  if x['request']['subtype']=='initialize':
+   send({'type':'control_response','response':{'request_id':x['request_id'],'subtype':'success'}})
+   continue
+  settings=x['request']['settings']
+  if 'effortLevel' in settings:
+   effort=settings['effortLevel']
+   effort_id=x['request_id']
+   continue
+  if effort_id:
+   send({'type':'control_response','response':{'request_id':effort_id,'subtype':'success'}})
+  fresh=json.loads(x['request']['settings']['env']['CLAUDE_CODE_EXTRA_BODY'])
+  rejected=turns>0 and 'reject' in json.dumps(fresh)
+  if not rejected:body=fresh
+  send({'type':'control_response','response':{'request_id':'unrelated','subtype':'success'}})
+  send({'type':'control_response','response':{'request_id':x['request_id'],'subtype':'error' if rejected else 'success','error':'probe rejected'}})
+  continue
+ turns+=1
+ send({'type':'stream_event','event':{'type':'message_start','message':{'id':'m','model':'claude-sonnet-5'}}})
+ text=str(os.getpid())+' '+effort+' '+json.dumps(body,sort_keys=True)
+ send({'type':'stream_event','event':{'type':'content_block_delta','index':0,'delta':{'type':'text_delta','text':text}}})
+ send({'type':'stream_event','event':{'type':'message_delta','delta':{'stop_reason':'end_turn'}}})
+ send({'type':'stream_event','event':{'type':'message_stop'}})
+`
+	testenv.Program(t, filepath.Join(dir, "claude"), script)
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("CLAUDE_CODE_EXTRA_BODY", `{"model":"must-not-leak"}`)
+	s := New()
+	t.Cleanup(s.subscription.abortAll)
+	p := provider.Provider{ID: "claude", Account: &provider.Account{Agent: "claude", User: "u"}}
+	messages := []map[string]any{{"role": "assistant", "content": "seed"}, {"role": "user", "content": "hi"}}
+	var pid string
+	for i, context := range []string{"first", "second", "", "third", "reject"} {
+		b := map[string]any{"model": "claude-sonnet-5", "max_tokens": 64, "stream": false, "messages": messages}
+		effort := []string{"high", "low"}[i%2]
+		b["thinking"] = map[string]any{"type": "adaptive"}
+		b["output_config"] = map[string]any{"effort": effort}
+		if context != "" {
+			b["safeguards"] = []any{map[string]any{"type": "dangerous_tool_use", "classifier_context": map[string]any{"marker": context, "future": []int{1, 2}}}}
+		}
+		body, _ := json.Marshal(b)
+		req := httptest.NewRequest("POST", "/v1/messages", strings.NewReader(string(body)))
+		req.Header.Set("anthropic-beta", "claude-code-20250219,dangerous-tool-use-2026-09-03")
+		rec := httptest.NewRecorder()
+		var usage Usage
+		if code, msg := s.serveClaudeSubscription(rec, req, provider.Anthropic, p, "claude-sonnet-5", body, &usage); code != 200 {
+			t.Fatalf("%d %s", code, msg)
+		}
+		var a struct {
+			Content []struct {
+				Text string `json:"text"`
+			} `json:"content"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &a); err != nil || len(a.Content) != 1 {
+			t.Fatalf("bad reply %s", rec.Body)
+		}
+		text := a.Content[0].Text
+		parts := strings.SplitN(text, " ", 3)
+		if len(parts) != 3 {
+			t.Fatalf("no pid/context: %s", text)
+		}
+		if parts[1] != effort {
+			t.Fatalf("stale effort: %s, want %s", parts[1], effort)
+		}
+		if pid != "" && (parts[0] == pid) == (context == "reject") {
+			t.Fatalf("wrong reuse for %q: %s => %s", context, pid, parts[0])
+		}
+		pid = parts[0]
+		var extra map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(parts[2]), &extra); err != nil {
+			t.Fatal(err)
+		}
+		expected := safeguardBody(nil)
+		if v := b["safeguards"]; v != nil {
+			raw, _ := json.Marshal(v)
+			expected = safeguardBody(raw)
+		}
+		got, _ := json.Marshal(extra)
+		if string(got) != expected {
+			t.Fatalf("stale/modified context: %s != %s", got, expected)
+		}
+		messages = append(messages, map[string]any{"role": "assistant", "content": text}, map[string]any{"role": "user", "content": "next"})
+	}
+}
+
+// The beta must reach a Claude Code running in WSL as well as a native run.
+func TestClaudeBridgeSafeguardWSLEnv(t *testing.T) {
+	cli := claudeCLI{wsl: &wslrun.Tool{}}
+	env := cli.env([]string{"ANTHROPIC_BETAS=dangerous-tool-use-2026-09-03"}, "")
+	if !slices.Contains(env, "ANTHROPIC_BETAS=dangerous-tool-use-2026-09-03") ||
+		!slices.Contains(env, "WSLENV=ANTHROPIC_BETAS") {
+		t.Fatalf("safety beta not forwarded to WSL: %v", env)
+	}
+}
+
+// A context update and its tool-result handoff own the run together, through
+// the reply's end. Another caller cannot update it or abort its owner: it is
+// a conversation of its own from there (a fork sub-agent of the same lead),
+// and gets a run of its own, not a 409 (ylorn on Discord).
+func TestClaudeBridgeSafeguardConcurrentHandoff(t *testing.T) {
+	s := New()
+	b := s.subscription
+	input, stdin := io.Pipe()
+	stdout, output := io.Pipe()
+	run := &subscriptionRun{bridge: b, token: "tok", stdin: stdin, safeguardBeta: "dangerous-tool-use-2026-09-03",
+		pending: map[string]chan mcpToolResult{"a": make(chan mcpToolResult, 1), "b": make(chan mcpToolResult, 1)}}
+	b.runs[run.token], b.calls["a"], b.calls["b"] = run, run, run
+	t.Cleanup(func() { b.abortAll(); stdin.Close(); input.Close(); output.Close(); stdout.Close() })
+	go run.readOutput(stdout)
+	go func() {
+		scanner := bufio.NewScanner(input)
+		for scanner.Scan() {
+			var ctl struct {
+				RequestID string `json:"request_id"`
+			}
+			if json.Unmarshal(scanner.Bytes(), &ctl) == nil {
+				fmt.Fprintf(output, "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":%q}}\n", ctl.RequestID)
+			}
+		}
+	}()
+	req := &Request{SafeguardBeta: run.safeguardBeta, Safeguards: json.RawMessage(`[{"context":"A"}]`),
+		Messages: []Message{{Role: "assistant"}, {Role: "user", Parts: []Part{{Kind: ToolResult, CallID: "a", Text: "A"}}}}}
+	found, results := b.findRun(req)
+	if found != run || !found.claimResume() {
+		t.Fatal("first claim failed")
+	}
+	if err := run.setSafeguards(req); err != nil {
+		t.Fatal(err)
+	}
+	run.endSegment() // a late end with no attached segment cannot release A
+	// B arrives after A's ACK and before its handoff, then again while A's
+	// reply is active, using another call that still maps to the same run.
+	blocked := func(id string) {
+		t.Helper()
+		body := []byte(`{"model":"claude-sonnet-5","max_tokens":64,"safeguards":[{"context":"B"}],"messages":[{"role":"assistant","content":"call"},{"role":"user","content":[{"type":"tool_result","tool_use_id":"` + id + `","content":"B"}]}]}`)
+		done := make(chan int, 1)
+		var started atomic.Bool
+		go func() {
+			rec := httptest.NewRecorder()
+			code, _ := s.serveSubscription(rec, httptest.NewRequest("POST", "/v1/messages", nil), provider.Anthropic, "Claude Code", req.Model, "", body, &Usage{},
+				func(context.Context, *Request) (*subscriptionRun, <-chan Event, error) {
+					started.Store(true)
+					return nil, nil, fmt.Errorf("a run of its own")
+				})
+			done <- code
+		}()
+		select {
+		case code := <-done:
+			if code == 409 || !started.Load() || run.closed || string(run.safeguards) != string(req.Safeguards) {
+				t.Fatalf("second caller: status %d, own run %v, closed %v, context %s", code, started.Load(), run.closed, run.safeguards)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("second caller was held on the claimed run")
+		}
+	}
+	blocked("a")
+	waiter := run.pending["a"]
+	segment, err := run.continueWith(results, nil)
+	if err != nil || (<-waiter).Content[0]["text"] != "A" {
+		t.Fatalf("first handoff: %v", err)
+	}
+	blocked("b")
+	fmt.Fprintln(output, `{"type":"stream_event","event":{"type":"message_start","message":{"id":"m"}}}`)
+	fmt.Fprintln(output, `{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"tool_use"}}}`)
+	fmt.Fprintln(output, `{"type":"stream_event","event":{"type":"message_stop"}}`)
+	for range segment {
+	}
+	req.Messages[1].Parts[0].CallID = "b"
+	if next, _ := b.findRun(req); next != run || !next.claimResume() {
+		t.Fatal("claim not released at segment end")
 	}
 }

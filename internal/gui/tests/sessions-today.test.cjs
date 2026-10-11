@@ -47,6 +47,8 @@ function serve(lang, reads) {
       return json({ count: 3, median: 1000, p90: 2000, days: days.map(() => 1), messages: days.map(() => 10), output: days.map(() => 0), top: { tokens: [], cost: [], active: [] } });
     }
     if (url.pathname === "/api/groups") return json({ groups: [] });
+    // opening the page asks for the quotas too (an array, as the Go side writes it)
+    if (url.pathname === "/api/usage/quotas") return json([]);
     if (url.pathname.startsWith("/api/")) return json({});
     const file = path.join(assets, url.pathname === "/" ? "index.html" : url.pathname);
     const contentType = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml", ".png": "image/png" }[path.extname(file)];
@@ -56,8 +58,8 @@ function serve(lang, reads) {
 }
 
 const want = {
-  en: { day: new Date(today + "T12:00:00Z").toLocaleDateString("en", { month: "short", day: "numeric", timeZone: "UTC" }), tokens: (m) => `${m} tokens`, output: "Output tokens" },
-  zh: { day: new Date(today + "T12:00:00Z").toLocaleDateString("zh-CN", { month: "short", day: "numeric", timeZone: "UTC" }), tokens: (m) => `${m} token`, output: "输出 Token" },
+  en: { day: new Date(today + "T12:00:00Z").toLocaleDateString("en", { month: "short", day: "numeric", timeZone: "UTC" }), tokens: (n) => `${(1.1 * n).toFixed(1).replace(/\.0$/, "")}M tokens`, output: "Output tokens" },
+  zh: { day: new Date(today + "T12:00:00Z").toLocaleDateString("zh-CN", { month: "short", day: "numeric", timeZone: "UTC" }), tokens: (n) => `${(1.1 * n).toFixed(1).replace(/\.0$/, "")}M token`, output: "输出 Token" },
 };
 
 for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
@@ -85,7 +87,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert(n >= 1);
         const tt = await title();
         assert(tt.startsWith(w.day + " · "), tt);
-        assert(tt.includes(w.tokens((1.1 * n).toFixed(1).replace(/\.0$/, "") + "M")), tt);
+        assert(tt.includes(w.tokens(n)), tt);
       });
 
       await t.test("read again while hovered, the bar stays, its title today's now", async () => {
@@ -97,7 +99,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await page.waitForFunction((b) => document.querySelector("#sessChart .bars > .bar:last-child")?.title !== b, before);
         assert(reads.n > was, "the sessions were not read again");
         const now = await title();
-        assert(now.includes(w.tokens((1.1 * reads.n).toFixed(1).replace(/\.0$/, "") + "M")), now);
+        assert(now.includes(w.tokens(reads.n)), now);
         assert.equal(await page.evaluate(() => window.__today.isConnected), true, "today's bar was drawn anew under the pointer");
         assert.equal(await page.evaluate(() => window.__today.matches(":hover")), true);
         assert.equal(await bars.count(), 30);
@@ -113,7 +115,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await page.locator("#sessChart .segs .opt", { hasText: w.output }).click();
         await page.waitForFunction(() => document.querySelector("#sessChart .bars > .bar:last-child i.in") === null);
         const tt = await title();
-        assert(tt.includes(w.tokens((1.1 * n).toFixed(1).replace(/\.0$/, "") + "M")), tt);
+        assert(tt.includes(w.tokens(n)), tt);
       });
 
       assert.deepEqual(errors, []);

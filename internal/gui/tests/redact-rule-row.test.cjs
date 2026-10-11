@@ -9,6 +9,7 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
+const { watchSettingsReads, settingsDrawn } = require("./reader.cjs");
 
 const assets = path.resolve(__dirname, "../assets");
 const settings = (lang) => ({ lang, theme: "light", redact: true, redactRules: [{ kind: "GATEWAY_KEY", prefix: "oc_sk_" }] });
@@ -47,9 +48,11 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const errors = [];
         page.on("pageerror", (e) => errors.push(e.message));
         await page.route("**/*", serve(lang));
-        await page.goto("http://magpie.test/?view=settings");
+        await watchSettingsReads(page);
+        await page.goto("http://magpie.test/?view=settings&tab=privacy");
         const row = page.locator("#redactList .row.rule-row");
         await row.waitFor();
+        await settingsDrawn(page); // the row found is the one that stays (#1653)
         await row.scrollIntoViewIfNeeded();
 
         const m = await row.evaluate((r) => {
@@ -74,13 +77,16 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert(Math.abs(m.tools[0].l - m.who.l) < 1.5, `from the row's left edge: ${m.tools[0].l} vs ${m.who.l}`);
         assert(Math.abs(m.tools[3].r - m.val.r) < 1.5, `to its right: ${m.tools[3].r} vs ${m.val.r}`);
 
-        // the rule already added: its name, and its remove button on the right, on its line
+        // the rule already added: its name, and its remove button on the right —
+        // on its line, or, on a phone-width web page, on the line under it at the
+        // row's right edge (f3ba9184, #391: every web settings row wraps there)
         const next = await row.evaluate((r) => {
           const n = r.nextElementSibling, v = n.querySelector(".val").getBoundingClientRect(), who = n.querySelector(".who").getBoundingClientRect();
-          return { name: n.querySelector(".name").textContent, same: Math.abs((v.top + v.bottom) / 2 - (who.top + who.bottom) / 2) < 12, right: v.left > who.left + 100 };
+          return { name: n.querySelector(".name").textContent, same: Math.abs((v.top + v.bottom) / 2 - (who.top + who.bottom) / 2) < 12, right: v.left > who.left + 100, under: v.top >= who.bottom - 1, flush: Math.abs(v.right - who.right) < 1.5 };
         });
         assert.equal(next.name, "GATEWAY_KEY");
-        assert(next.same && next.right, "the added rule's row is as before");
+        if (width > 760) assert(next.same && next.right, `the added rule's row is as before: ${JSON.stringify(next)}`);
+        else assert(next.under && next.flush && next.right, `the added rule's Remove is under its name, on the right: ${JSON.stringify(next)}`);
 
         // Regex picked: the match's hint changes, nothing moves
         const before = await page.evaluate(() => [scrollX, scrollY, document.querySelector("#view-settings")?.closest("[class]")?.scrollTop]);

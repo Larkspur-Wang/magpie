@@ -35,6 +35,7 @@ type fakeS3 struct {
 	noCond             bool
 	log                []string // each request: method, and the condition sent
 	onWrite            func()   // runs once, at the next PUT or HEAD (a write's look first), before it is answered
+	sent               int      // the bytes of objects read
 }
 
 func newFakeS3(t *testing.T) (*fakeS3, *httptest.Server) {
@@ -85,7 +86,13 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.Header().Set("ETag", f.etags[key])
+		// a read of the version already had: 304, and no body
+		if r.Method == http.MethodGet && r.Header.Get("If-None-Match") == f.etags[key] {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
 		if r.Method == http.MethodGet {
+			f.sent += len(b)
 			w.Write(b)
 		}
 	case http.MethodPut:
@@ -159,26 +166,27 @@ func TestS3Put(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if data, etag, err := s.get(ctx); data != nil || etag != "" || err != nil {
-		t.Fatalf("nothing there: %q %q %v", data, etag, err)
+	if data, v, err := s.get(ctx, version{}); data != nil || v.ETag != "" || err != nil {
+		t.Fatalf("nothing there: %q %q %v", data, v.ETag, err)
 	}
-	if err := s.put(ctx, []byte("one"), ""); err != nil {
+	if _, err := s.put(ctx, []byte("one"), ""); err != nil {
 		t.Fatal(err)
 	}
 	if got := string(f.objects["team x+y/magpie/magpie.magpie-backup"]); got != "one" {
 		t.Fatalf("stored %q", got)
 	}
-	if err := s.put(ctx, []byte("another first"), ""); !errors.Is(err, errChanged) {
+	if _, err := s.put(ctx, []byte("another first"), ""); !errors.Is(err, errChanged) {
 		t.Fatalf("a first write over one there: %v", err)
 	}
-	data, etag, err := s.get(ctx)
+	data, v, err := s.get(ctx, version{})
+	etag := v.ETag
 	if string(data) != "one" || etag == "" || err != nil {
 		t.Fatalf("read: %q %q %v", data, etag, err)
 	}
-	if err := s.put(ctx, []byte("two"), etag); err != nil {
+	if _, err := s.put(ctx, []byte("two"), etag); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.put(ctx, []byte("three"), etag); !errors.Is(err, errChanged) {
+	if _, err := s.put(ctx, []byte("three"), etag); !errors.Is(err, errChanged) {
 		t.Fatalf("a write over a version since changed: %v", err)
 	}
 	if got := string(f.objects["team x+y/magpie/magpie.magpie-backup"]); got != "two" {
@@ -201,7 +209,7 @@ func TestS3Put(t *testing.T) {
 		cfg := f.config(srv)
 		c.change(&cfg)
 		s, _ := newS3(cfg)
-		if _, _, err := s.get(ctx); err == nil || !strings.Contains(err.Error(), c.want) {
+		if _, _, err := s.get(ctx, version{}); err == nil || !strings.Contains(err.Error(), c.want) {
 			t.Errorf("%+v: %v, want %q", cfg, err, c.want)
 		}
 	}
@@ -218,21 +226,23 @@ func TestS3NoConditions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.put(ctx, []byte("one"), ""); err != nil {
+	if _, err := s.put(ctx, []byte("one"), ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.put(ctx, []byte("another first"), ""); !errors.Is(err, errChanged) {
+	if _, err := s.put(ctx, []byte("another first"), ""); !errors.Is(err, errChanged) {
 		t.Fatalf("a first write over one there: %v", err)
 	}
-	_, etag, _ := s.get(ctx)
+	_, v, _ := s.get(ctx, version{})
+	etag := v.ETag
 	f.mu.Lock()
 	f.store("team x+y/magpie/magpie.magpie-backup", []byte("theirs"))
 	f.mu.Unlock()
-	if err := s.put(ctx, []byte("two"), etag); !errors.Is(err, errChanged) {
+	if _, err := s.put(ctx, []byte("two"), etag); !errors.Is(err, errChanged) {
 		t.Fatalf("a write over another computer's: %v", err)
 	}
-	_, etag, _ = s.get(ctx)
-	if err := s.put(ctx, []byte("two"), etag); err != nil {
+	_, v, _ = s.get(ctx, version{})
+	etag = v.ETag
+	if _, err := s.put(ctx, []byte("two"), etag); err != nil {
 		t.Fatal(err)
 	}
 	if got := string(f.objects["team x+y/magpie/magpie.magpie-backup"]); got != "two" {
@@ -404,6 +414,87 @@ func TestConfigureS3Secret(t *testing.T) {
 	}
 }
 
+// Moving sync between a WebDAV folder and an S3 bucket keeps the server
+// moved from, its password too, and moving back finds it (ARNO on
+// Discord: trying S3 wiped the WebDAV address, user and password). A
+// sync.json from before, with no other server in it, reads as it did.
+func TestConfigureKeepsTheOtherKind(t *testing.T) {
+	newComputer(t).use(t)
+	old := `{"url":"https://dav.example.com/dav/","user":"me","password":"pw","passphrase":"correct horse","keys":true,"agents":true}`
+	os.MkdirAll(path(""), 0o755)
+	if err := os.WriteFile(path("sync.json"), []byte(old), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if c, ok := Load(); !ok || c.URL != "https://dav.example.com/dav/" || c.Password != "pw" || c.Other != nil {
+		t.Fatalf("a setup from before: %v %+v", ok, c)
+	}
+	if v := Status(); v.Kind != "webdav" || !v.PasswordSet || v.Other != nil {
+		t.Fatalf("its view: %+v", v)
+	}
+
+	r2 := Config{URL: "s3://bkt/p", Endpoint: "https://acct.r2.cloudflarestorage.com", Region: "auto", PathStyle: true, User: "AKID", Password: "secret", Keys: true}
+	if err := Configure(r2); err != nil {
+		t.Fatal(err)
+	}
+	c, _ := Load()
+	if !c.S3() || c.Password != "secret" || c.Passphrase != "correct horse" ||
+		c.Other == nil || *c.Other != (Server{URL: "https://dav.example.com/dav/", User: "me", Password: "pw"}) {
+		t.Fatalf("to S3: %+v %+v", c, c.Other)
+	}
+	v := Status()
+	if v.Kind != "s3" || v.Other == nil || v.Other.Kind != "webdav" || v.Other.URL != "https://dav.example.com/dav/" || v.Other.User != "me" || !v.Other.PasswordSet {
+		t.Fatalf("its view: %+v %+v", v, v.Other)
+	}
+	// a change to the bucket keeps it too
+	if err := Configure(Config{URL: "s3://bkt/q", Endpoint: r2.Endpoint, Region: "auto", PathStyle: true, User: "AKID"}); err != nil {
+		t.Fatal(err)
+	}
+	if c, _ := Load(); c.Password != "secret" || c.Other == nil || c.Other.Password != "pw" {
+		t.Fatalf("S3 changed: %+v", c)
+	}
+
+	// back to WebDAV, the password not typed again: the one kept, and the
+	// bucket kept in turn
+	back := Config{URL: "https://dav.example.com/dav/", User: "me"}
+	if kept, needed := SavedPassword(back); !kept || needed {
+		t.Fatalf("SavedPassword kept %v, needed %v", kept, needed)
+	}
+	if err := Configure(back); err != nil {
+		t.Fatal(err)
+	}
+	c, _ = Load()
+	if c.S3() || c.Password != "pw" || c.Endpoint != "" || c.Other == nil ||
+		*c.Other != (Server{URL: "s3://bkt/q", User: "AKID", Password: "secret", Endpoint: r2.Endpoint, Region: "auto", PathStyle: true}) {
+		t.Fatalf("back to WebDAV: %+v %+v", c, c.Other)
+	}
+	// and to S3 again: its secret kept for that key at that endpoint alone
+	if err := Configure(Config{URL: "s3://bkt/q", Endpoint: r2.Endpoint, User: "AKID"}); err != nil {
+		t.Fatal(err)
+	}
+	if c, _ := Load(); c.Password != "secret" || c.Other == nil || c.Other.Password != "pw" {
+		t.Fatalf("to S3 again: %+v", c)
+	}
+	Configure(back)
+	if err := Configure(Config{URL: "s3://bkt/q", Endpoint: "https://other.example.com", User: "AKID"}); err == nil || !strings.Contains(err.Error(), "type the secret") {
+		t.Fatalf("another endpoint: %v", err)
+	}
+	// the server given is never taken as the one kept
+	if err := Configure(Config{URL: "https://dav.example.com/dav/", User: "me", Other: &Server{URL: "s3://evil", User: "x", Password: "y"}}); err != nil {
+		t.Fatal(err)
+	}
+	if c, _ := Load(); c.Other == nil || c.Other.URL != "s3://bkt/q" {
+		t.Fatalf("the kept one replaced: %+v", c.Other)
+	}
+
+	// off is off: nothing kept
+	if err := Off(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path("sync.json")); !os.IsNotExist(err) {
+		t.Fatalf("after off: %v", err)
+	}
+}
+
 // A real S3 server, when one is given: MAGPIE_S3_TEST=endpoint,bucket,key
 // id,secret[,region] (a MinIO: docker run -p 9000:9000 minio/minio server
 // /data, and a bucket made there). The same writes as TestS3Put, then a sync.
@@ -425,26 +516,27 @@ func TestS3Live(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if data, _, err := s.get(ctx); data != nil || err != nil {
+	if data, _, err := s.get(ctx, version{}); data != nil || err != nil {
 		t.Fatalf("nothing there: %q %v", data, err)
 	}
-	if err := s.put(ctx, []byte("one"), ""); err != nil {
+	if _, err := s.put(ctx, []byte("one"), ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.put(ctx, []byte("another first"), ""); !errors.Is(err, errChanged) {
+	if _, err := s.put(ctx, []byte("another first"), ""); !errors.Is(err, errChanged) {
 		t.Fatalf("a first write over one there: %v", err)
 	}
-	data, etag, err := s.get(ctx)
+	data, v, err := s.get(ctx, version{})
+	etag := v.ETag
 	if string(data) != "one" || etag == "" || err != nil {
 		t.Fatalf("read: %q %q %v", data, etag, err)
 	}
-	if err := s.put(ctx, []byte("two"), etag); err != nil {
+	if _, err := s.put(ctx, []byte("two"), etag); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.put(ctx, []byte("three"), etag); !errors.Is(err, errChanged) {
+	if _, err := s.put(ctx, []byte("three"), etag); !errors.Is(err, errChanged) {
 		t.Fatalf("a write over a version since changed: %v", err)
 	}
-	if data, _, _ := s.get(ctx); string(data) != "two" {
+	if data, _, _ := s.get(ctx, version{}); string(data) != "two" {
 		t.Fatalf("read: %q", data)
 	}
 	_, fellBack := unconditional.Load(s.endpoint.String() + " " + s.bucket)
@@ -453,7 +545,7 @@ func TestS3Live(t *testing.T) {
 	bad := cfg
 	bad.Password += "x"
 	if s, _ := newS3(bad); s != nil {
-		if _, _, err := s.get(ctx); err == nil || !strings.Contains(err.Error(), "refused the access key") {
+		if _, _, err := s.get(ctx, version{}); err == nil || !strings.Contains(err.Error(), "refused the access key") {
 			t.Errorf("a wrong secret: %v", err)
 		}
 	}
@@ -470,7 +562,7 @@ func TestS3Live(t *testing.T) {
 		t.Fatal(err)
 	}
 	s, _ = newS3(cfg)
-	up, _, err := s.get(ctx)
+	up, _, err := s.get(ctx, version{})
 	if err != nil || len(up) == 0 || strings.Contains(string(up), "deepseek") {
 		t.Fatalf("in the bucket: %v %q", err, up)
 	}

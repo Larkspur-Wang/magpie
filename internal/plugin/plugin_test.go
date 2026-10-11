@@ -9,9 +9,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -19,18 +19,17 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/netproxy"
+	"github.com/yetone/magpie/internal/testenv"
 )
 
 // sandbox gives the test its own magpie folders and the Bun on PATH; a
 // machine without Bun skips it.
 func sandbox(t *testing.T) {
 	t.Helper()
-	bun, err := exec.LookPath("bun")
-	if err != nil {
-		t.Skip("no bun on PATH")
-	}
+	bun := testenv.Bun(t)
 	dir := t.TempDir()
 	t.Setenv("HOME", dir)
+	t.Setenv("USERPROFILE", dir)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(dir, "config"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(dir, "cache"))
 	t.Setenv("MAGPIE_BUN", bun)
@@ -82,6 +81,10 @@ func TestFakePlugin(t *testing.T) {
 		if want := map[string][2]bool{"fake-1": {false, false}, "fake-claude": {true, true}, "fake-gemini": {false, true}}[m.ID]; m.Image != want[0] || m.ImageSaid != want[1] {
 			t.Errorf("%s: image %v, said %v; want %v", m.ID, m.Image, m.ImageSaid, want)
 		}
+		// a model's credit rate, as the plugin gave it, number or "x0.03"
+		if want := map[string][2]float64{"fake-claude": {0.5, 1}, "fake-gemini": {0.03, 0}}[m.ID]; m.Rate != want[0] || m.RateWas != want[1] {
+			t.Errorf("%s: rate %v, was %v; want %v", m.ID, m.Rate, m.RateWas, want)
+		}
 	}
 
 	// the browser method asks where, then a team only for work
@@ -121,7 +124,7 @@ func TestFakePlugin(t *testing.T) {
 	if saved["fakeco"]["type"] != "oauth" || saved["fakeco"]["refresh"] != "r-blue" || saved["fakeco"]["accountId"] != "blue@fake" {
 		t.Fatalf("saved %v", saved)
 	}
-	if fi, _ := os.Stat(AuthPath()); fi.Mode().Perm() != 0o600 {
+	if fi, _ := os.Stat(AuthPath()); runtime.GOOS != "windows" && fi.Mode().Perm() != 0o600 { // Windows keeps no mode bits
 		t.Fatalf("plugin-auth.json is %v", fi.Mode().Perm())
 	}
 	if !SignedIn("fakeco") {
@@ -408,6 +411,51 @@ func TestPluginProxy(t *testing.T) {
 	// and the next with none of its own takes magpie's again
 	if b, err := fetch(ctx); err != nil || b != "global" {
 		t.Fatalf("after a direct one: %q, %v", b, err)
+	}
+}
+
+// A sign-in goes through the proxy it was begun with (#1663): the
+// plugin's requests while it authorizes, and the ones its callback makes
+// to trade the code, which Finish is asked for with no proxy named; the
+// global one is asked for neither.
+func TestPluginSignInProxy(t *testing.T) {
+	sandbox(t)
+	var mu sync.Mutex
+	var own, global []string
+	proxy := func(seen *[]string) *httptest.Server {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			*seen = append(*seen, r.URL.String())
+			mu.Unlock()
+			fmt.Fprint(w, "ok")
+		}))
+		t.Cleanup(srv.Close)
+		return srv
+	}
+	ownSrv, globalSrv := proxy(&own), proxy(&global)
+	t.Setenv("HTTP_PROXY", globalSrv.URL)
+	t.Setenv("http_proxy", globalSrv.URL)
+	t.Setenv("FAKE_SIGNIN", "http://vendor.invalid/signin")
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	abs, _ := filepath.Abs("testdata/fake/index.js")
+	if _, err := Add(ctx, abs); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Providers(ctx); err != nil {
+		t.Fatal(err)
+	}
+	a, err := Authorize(netproxy.With(ctx, ownSrv.URL), "fakeco", 1, map[string]string{"where": "home"}, NewAccount)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Finish(ctx, a.Session, "good"); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !slices.Equal(own, []string{"http://vendor.invalid/signin/device", "http://vendor.invalid/signin/token"}) || len(global) != 0 {
+		t.Fatalf("the sign-in's own proxy saw %q, the global one %q", own, global)
 	}
 }
 

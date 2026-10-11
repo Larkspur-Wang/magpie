@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -235,11 +236,18 @@ func ReadInstructions() (*InstructionsView, error) {
 	if err != nil {
 		return nil, err
 	}
+	return l.instructionsView(Targets()), nil
+}
+
+// instructionsView is the Instructions page for these agents. They are
+// passed in: finding them looks through every agent's folders, in WSL too,
+// which one read of the Library did three times over (#1624).
+func (l *Library) instructionsView(targets []*Target) *InstructionsView {
 	v := &InstructionsView{Shared: readText(l.sharedPath()), Agents: []AgentInstructions{}}
 	for _, s := range l.sets() {
 		v.Sets = append(v.Sets, SetView{ID: s.ID, Name: s.Name, Text: readText(setPath(s.ID)), Active: s.ID == l.active()})
 	}
-	for _, t := range Targets() {
+	for _, t := range targets {
 		if t.Instructions == "" {
 			continue
 		}
@@ -258,7 +266,7 @@ func ReadInstructions() (*InstructionsView, error) {
 		}
 		v.Agents = append(v.Agents, ai)
 	}
-	return v, nil
+	return v
 }
 
 // InstructionsChange is what the page saves: the shared text, which agents
@@ -280,9 +288,42 @@ type InstructionsChange struct {
 	Remove   string             `json:"remove,omitempty"`
 }
 
+// changeInstructions is change for the instructions alone: it writes them
+// into the agents and nothing else. Through change, a set made, saved or
+// removed gave every agent its MCP servers and skills again too, looking
+// through every skill folder, which took up to a minute a click on Windows
+// (#1624, Hipple).
+func changeInstructions(f func(l *Library) error) (*Result, error) {
+	mu.Lock()
+	defer mu.Unlock()
+	l, err := load()
+	if err != nil {
+		return nil, err
+	}
+	if err := f(l); err != nil {
+		return nil, err
+	}
+	if err := l.save(); err != nil {
+		return nil, err
+	}
+	res := &Result{Changed: []string{}, Problems: []Problem{}}
+	b := l.kept
+	if b == nil {
+		b = newBackups()
+	}
+	for _, t := range Targets() {
+		l.syncInstructions(t, b, res)
+	}
+	res.Backup = b.dir
+	if b.dir != "" {
+		pruneBackups()
+	}
+	return res, l.save()
+}
+
 // SaveInstructions saves the change and writes it into the agents.
 func SaveInstructions(c InstructionsChange) (*Result, error) {
-	return change(func(l *Library) error {
+	return changeInstructions(func(l *Library) error {
 		if err := l.changeSets(c); err != nil {
 			return err
 		}
@@ -321,7 +362,7 @@ func ImportInstructions(id string) (*Result, error) {
 	if t == nil || t.Instructions == "" {
 		return nil, fmt.Errorf("%s has no instructions file magpie knows", id)
 	}
-	return change(func(l *Library) error {
+	return changeInstructions(func(l *Library) error {
 		raw, err := edit.Read(t.Instructions)
 		if err != nil {
 			return err
@@ -409,6 +450,23 @@ func (l *Library) changeSets(c InstructionsChange) error {
 			return err
 		}
 		l.Instructions.Sets = slices.DeleteFunc(l.Instructions.Sets, func(s InstrSet) bool { return s.ID == id })
+	}
+	// an empty set in use gives the agents nothing, so a set added, or one
+	// given text, is the one they read from then on (Fate on Discord: a new
+	// set was written into no agent while the Default set read was empty)
+	if c.Activate == "" && c.Shared == nil && readText(setPath(l.active())) == "" {
+		if x := c.Create; x != nil {
+			l.Instructions.Active = x.ID
+		}
+		for _, id := range slices.Sorted(maps.Keys(c.Texts)) {
+			if x := c.Texts[id]; x != nil && strings.TrimSpace(*x) != "" && id != l.active() {
+				l.Instructions.Active = id
+				break
+			}
+		}
+		if l.Instructions.Active == defaultSet {
+			l.Instructions.Active = ""
+		}
 	}
 	if id := c.Activate; id != "" {
 		if !l.hasSet(id) {

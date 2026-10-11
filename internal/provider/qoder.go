@@ -1,5 +1,14 @@
 package provider
 
+// PLUGIN-SERVED (see AGENTS.md): Qoder ("qoder") and Qoder CN ("qoder-cn")
+// are deprecated built-in subscriptions served by their plugin,
+// @magpie-community/opencode-qoder-auth, each once moved onto it
+// (provider.Moved; the default for a new sign-in). A moved one's
+// sign-ins, models, requests and usage are all the plugin's, never this
+// code's (only the move, in migrate*.go, still reads its accounts). A fix here alone doesn't reach those users; fix the plugin
+// (github.com/magpie-community/plugins, packages/qoder) and raise the
+// movers' min in internal/provider/migrate_qoder.go.
+
 import (
 	"context"
 	"encoding/json"
@@ -14,6 +23,7 @@ import (
 
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/qoder"
+	"github.com/yetone/magpie/internal/settings"
 )
 
 // qoderMu serializes checking, rotating and saving tokens, including sign-in
@@ -148,6 +158,9 @@ func qoderSaved(l savedLogin) (qoder.Credential, bool) {
 // With nothing to move it takes no lock, so listing accounts doesn't wait
 // behind a refresh.
 func migrateQoder() error {
+	if settings.AccountDiscoveryOff() {
+		return nil
+	}
 	path := filepath.Join(filepath.Dir(Path()), "qoder.json")
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		return nil
@@ -278,7 +291,7 @@ func qoderUser(c *qoder.Credential) *qoder.User {
 }
 
 // qoderSave keeps c under its site's accounts.
-func qoderSave(c qoder.Credential) error {
+func qoderSave(c qoder.Credential) (err error) {
 	site := c.OnSite()
 	agent := site.ID
 	if c.UID == "" || c.Token == "" {
@@ -290,6 +303,13 @@ func qoderSave(c qoder.Credential) error {
 			return err
 		}
 	}
+	// its kept usage reading was read under the old sign-in (as
+	// addSideLogin drops it), once the locks are let go
+	defer func() {
+		if err == nil {
+			StaleAllowance(agent, qoderWho(c))
+		}
+	}()
 	qoderMu.Lock()
 	defer qoderMu.Unlock()
 	if c.MachineID == "" {
@@ -515,7 +535,7 @@ func startQoderSignIn(s *signInFlow, site *qoder.Site) error {
 	if err != nil {
 		return fmt.Errorf("%s sign-in: %w", site.Name, err)
 	}
-	ctx, cancel := context.WithDeadline(context.Background(), fl.deadline)
+	ctx, cancel := context.WithDeadline(s.via(context.Background()), fl.deadline)
 	s.mu.Lock()
 	s.st.URL, s.stop = authURL, cancel
 	s.mu.Unlock()

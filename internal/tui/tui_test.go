@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"slices"
@@ -9,6 +10,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/yetone/magpie/internal/agentenv"
 	"github.com/yetone/magpie/internal/library"
 	"github.com/yetone/magpie/internal/provider"
 )
@@ -24,9 +26,12 @@ func home(t *testing.T) string {
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(h, ".cache"))
 	t.Setenv("PATH", "")
 	t.Setenv("XDG_DATA_HOME", filepath.Join(h, ".local", "share"))
-	for _, k := range []string{"CLAUDE_CONFIG_DIR", "CODEX_HOME", "APPDATA", "VISUAL", "EDITOR", "OPENCODE_DB", "PI_CODING_AGENT_DIR", "OMO_CODING_AGENT_DIR", "SENPI_CODING_AGENT_DIR", "PI_CODING_AGENT_SESSION_DIR"} {
+	for _, k := range agentenv.Vars {
 		t.Setenv(k, "")
 	}
+	t.Setenv("APPDATA", "")
+	t.Setenv("VISUAL", "")
+	t.Setenv("EDITOR", "")
 	for _, f := range []string{".claude/settings.json", ".codex/config.toml"} {
 		write(t, filepath.Join(h, f), "")
 	}
@@ -310,5 +315,88 @@ func TestLibraryPage(t *testing.T) {
 	m = press(t, m, "d", "d")
 	if s := servers(); len(s) != 0 {
 		t.Fatalf("servers %+v", s)
+	}
+
+	// a skill of Claude Code's own: d twice takes it out of the agent
+	// without bringing it in (#1303)
+	old := filepath.Join(h, ".claude/skills/old")
+	write(t, filepath.Join(old, "SKILL.md"), "---\nname: old\ndescription: Not wanted\n---\n")
+	m = press(t, m, "s")
+	m.lrow = row("found-skill", "old")
+	m = press(t, m, "d")
+	if _, err := os.Stat(old); err != nil {
+		t.Fatal("one d removed it")
+	}
+	m = press(t, m, "d")
+	if _, err := os.Stat(old); !os.IsNotExist(err) {
+		t.Fatalf("still there, flash %q", m.flash)
+	}
+	if slices.ContainsFunc(m.lib, func(r libRow) bool { return r.name == "old" }) {
+		t.Fatal("still listed")
+	}
+
+	// an MCP server of Claude Code's own, the same (#1618): the rest of
+	// its .claude.json stays
+	cj := filepath.Join(h, ".claude.json")
+	read := func() string {
+		b, err := os.ReadFile(cj)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b)
+	}
+	b, err := os.ReadFile(cj)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if len(b) > 0 {
+		if err := json.Unmarshal(b, &doc); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if doc == nil {
+		doc = map[string]any{}
+	}
+	doc["numStartups"] = 7
+	srvs, _ := doc["mcpServers"].(map[string]any)
+	if srvs == nil {
+		srvs = map[string]any{}
+	}
+	srvs["stale"] = map[string]any{"type": "stdio", "command": "stale-mcp"}
+	doc["mcpServers"] = srvs
+	b, _ = json.Marshal(doc)
+	write(t, cj, string(b))
+	m = press(t, m, "s")
+	m.lrow = row("found-mcp", "stale")
+	m = press(t, m, "d")
+	if !strings.Contains(read(), "stale-mcp") {
+		t.Fatal("one d removed it")
+	}
+	m = press(t, m, "d")
+	after := read()
+	var kept map[string]any
+	if err := json.Unmarshal([]byte(after), &kept); err != nil || strings.Contains(after, "stale") || kept["numStartups"] != float64(7) {
+		t.Fatalf("after two d, flash %q:\n%s", m.flash, after)
+	}
+	if slices.ContainsFunc(m.lib, func(r libRow) bool { return r.name == "stale" }) {
+		t.Fatal("still listed")
+	}
+}
+
+// A first run has no model catalog: Init syncs it, the status line says so
+// until it is done, and S doesn't start a second sync meanwhile.
+func TestFirstRunShowsCatalogSync(t *testing.T) {
+	home(t)
+	m := newModel()
+	m.w, m.h = 120, 40
+	if m.Init() == nil {
+		t.Fatal("no catalog, and Init didn't sync it")
+	}
+	if !m.syncing || !strings.Contains(m.View(), "syncing model catalog") {
+		t.Fatalf("syncing %v:\n%s", m.syncing, m.View())
+	}
+	if _, cmd := m.Update(keyMsg("S")); cmd != nil {
+		t.Fatal("S started a second sync while the first runs")
 	}
 }

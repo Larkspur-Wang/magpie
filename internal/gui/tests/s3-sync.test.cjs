@@ -49,7 +49,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
     test(`${engine} ${lang}: S3 sync settings`, async (t) => {
       const zh = lang === "zh";
       const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
-      const context = await browser.newContext({ viewport: { width: 900, height: 700 }, reducedMotion: "reduce" });
+      const context = await browser.newContext({ viewport: { width: 900, height: 420 }, reducedMotion: "reduce" });
       const page = await context.newPage();
       const errors = [], posts = [];
       page.on("pageerror", (error) => errors.push(error.message));
@@ -64,6 +64,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
 
       await page.goto("http://magpie.test/");
       await page.locator("#prefs").click();
+      await page.locator(":is(#setTab-sync, .nav-s[data-of=setTab-sync]):visible").click();
       const list = page.locator("#syncList");
       const first = list.locator(".row.pref").first();
       await first.waitFor({ state: "visible" });
@@ -91,7 +92,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       // at the page's end, then back up by the wheel till the choice is in sight
       await toEnd();
       const segTop = () => page.evaluate(() => document.querySelector(".sync-form .segs").getBoundingClientRect().top - document.querySelector("#view-settings").getBoundingClientRect().top);
-      for (let i = 0; i < 40 && (await segTop()) < 40; i++) { await page.mouse.wheel(0, -40); await page.waitForTimeout(15); }
+      for (let i = 0; i < 40 && (await segTop()) < 10; i++) { await page.mouse.wheel(0, -40); await page.waitForTimeout(15); }
       await page.waitForTimeout(300);
       const before = await top();
       assert.ok(before > 0, "the settings page must be scrolled");
@@ -124,7 +125,12 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await form.locator("label.tick").first().click(); // path-style
       // the WebDAV address typed before is still there, and isn't sent;
       // going back and forth, the shorter form too, moves nothing
+      // the fields filled scrolled the choice out of sight: wheeled back to it
+      await page.mouse.move(450, 300);
+      for (let i = 0; i < 40 && (await segTop()) < 10; i++) { await page.mouse.wheel(0, -40); await page.waitForTimeout(15); }
+      await page.waitForTimeout(300);
       const at = await top();
+      assert.ok(at > 0, "the settings page must still be scrolled");
       await form.locator(".segs .opt", { hasText: "WebDAV" }).click();
       await page.waitForTimeout(250);
       assert.equal(await top(), at, "picking WebDAV must not scroll the page");
@@ -132,6 +138,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await form.locator(".segs .opt", { hasText: "S3" }).click();
       await page.waitForTimeout(250);
       assert.equal(await top(), at, "picking S3 again must not scroll the page");
+      await toEnd(); // the save button, at the form's foot, wheeled into sight
       await save.click();
       await form.waitFor({ state: "detached" });
       assert.deepEqual(posts, [{ url: "s3://magpie-sync/team", user: "AKIDEXAMPLE", password: "s3cr3t", endpoint: "https://acct.r2.cloudflarestorage.com",
@@ -149,7 +156,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       for (let i = 0; i < 40 && (await under()); i++) { await page.mouse.wheel(0, -60); await page.waitForTimeout(30); }
       await edit.click();
       await form.waitFor({ state: "visible" });
-      assert.equal(await form.locator(".segs .opt.on").textContent(), "S3");
+      assert.equal(await form.locator(".segs .opt.on").textContent(), zh ? "S3 · 使用中" : "S3 · on");
       assert.equal(await box(L.bucket).inputValue(), "magpie-sync");
       assert.equal(await box(L.prefix).inputValue(), "team");
       assert.equal(await box(L.region).inputValue(), "auto");
@@ -159,6 +166,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert.equal(await form.locator("label.tick input").first().isChecked(), true);
 
       await page.setViewportSize({ width: 520, height: 700 });
+      // WebKit applies the sidebar's media rule to the new width at the next
+      // frame, so measure after that frame
+      await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
       assert.equal(await form.evaluate((e) => e.scrollWidth > e.clientWidth), false);
       assert.deepEqual(errors, []);
     });

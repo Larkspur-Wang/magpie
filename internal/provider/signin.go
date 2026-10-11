@@ -1,9 +1,10 @@
 package provider
 
 // Adding a subscription from magpie itself. magpie runs the vendor's own
-// browser sign-in — the one Claude Code's /login and `codex login` run, with
-// their OAuth clients — takes the tokens at a callback on this machine, and
-// keeps the account with the others in logins.json. An agent that has no
+// browser sign-in — the one `codex login` runs, with its OAuth client —
+// takes the tokens at a callback on this machine, and keeps the account
+// with the others in logins.json. A Claude account is signed in by Claude
+// Code itself (claude_signin.go). An agent that has no
 // account yet is signed in to it straight away; otherwise it stays one
 // click away, beside the rest.
 
@@ -25,20 +26,19 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/yetone/magpie/internal/netproxy"
+	"github.com/yetone/magpie/internal/settings"
 )
 
 // The vendors' sign-in pages; vars so tests can point them elsewhere.
 var (
-	claudeAuthorizeURL = "https://claude.com/cai/oauth/authorize"
-	codexAuthorizeURL  = "https://auth.openai.com/oauth/authorize"
-	devinAuthorizeURL  = "https://app.devin.ai/auth/cli/continue"
+	codexAuthorizeURL = "https://auth.openai.com/oauth/authorize"
+	devinAuthorizeURL = "https://app.devin.ai/auth/cli/continue"
 	// codexCallbackAddr is fixed: OpenAI only sends Codex's client back to
 	// port 1455.
 	codexCallbackAddr = "127.0.0.1:1455"
 )
-
-// claudeScopes are what Claude Code asks for at /login.
-const claudeScopes = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload user:plugins"
 
 const codexScopes = "openid profile email offline_access api.connectors.read api.connectors.invoke"
 
@@ -54,14 +54,25 @@ type SignInState struct {
 	State         string `json:"state"`                   // installing, waiting, done, failed or canceled
 	PasteCallback bool   `json:"pasteCallback,omitempty"` // a callback URL can also finish this sign-in
 	// PasteCode is a plugin's sign-in finished by the code its page shows
-	PasteCode    bool   `json:"pasteCode,omitempty"`
+	PasteCode bool `json:"pasteCode,omitempty"`
+	// PasteKey is a sign-in an API key made on KeysURL also finishes
+	// (Command Code's, whose page posts its key where a pasted address
+	// can't carry it)
+	PasteKey     bool   `json:"pasteKey,omitempty"`
+	KeysURL      string `json:"keysURL,omitempty"`
 	Instructions string `json:"instructions,omitempty"` // a plugin's words for its page
 	// Installing is the CLI being installed before the sign-in can start
 	Installing string `json:"installing,omitempty"`
 	User       string `json:"user,omitempty"`  // the account, once done
 	Plan       string `json:"plan,omitempty"`  //
 	Using      bool   `json:"using,omitempty"` // the agent was signed in to it too
-	Error      string `json:"error,omitempty"`
+	// Again is an account listed already: its sign-in was renewed rather
+	// than a new account added (#413)
+	Again bool   `json:"again,omitempty"`
+	Error string `json:"error,omitempty"`
+	// Proxy is the one the sign-in goes through ("" the global one,
+	// "direct" none): the one the account's requests will (#1663)
+	Proxy string `json:"proxy,omitempty"`
 }
 
 type signInFlow struct {
@@ -73,12 +84,66 @@ type signInFlow struct {
 	srv      *http.Server
 	stop     func() // ends an agent's own login command, when that is the sign-in
 	kiro     *kiroFlow
-	site     string // where to sign in, for an agent with more than one (ZCode: "zai" or "bigmodel")
-	plugin   string // a plugin's sign-in session, finished with the code pasted back
+	site     string           // where to sign in, for an agent with more than one (ZCode: "zai" or "bigmodel")
+	plugin   string           // a plugin's sign-in session, finished with the code pasted back
+	claude   *claudeCLISignIn // Claude Code's own sign-in, run by magpie
+	// pluginPorts are where a plugin's browser sign-in comes back to on
+	// this machine, for its address pasted (pluginsignin_paste.go)
+	pluginPorts []string
+
+	// nonce and hostID are a ChatGPT API sign-in's: what its ID token must
+	// carry, and this machine's id it registers magpie for (chatgpt_api.go)
+	nonce, hostID string
 	// claimed is a callback being traded for the account: the browser's own
 	// or a pasted address, whichever came first
 	claimed bool
-	done    chan struct{}
+	// finished is an outcome being recorded: the first finish's, which for a
+	// sign-in done reads as done once the account is shown again
+	finished bool
+	done     chan struct{}
+
+	// proxy is the one the sign-in's requests go through, as netproxy.With
+	// takes it: the one the account's will go through once it is signed in
+	// (ProxyOfLogin), or the one picked for it (chosen), which is kept as
+	// the account's once it is done (#1663)
+	proxy  string
+	chosen bool
+	// user is the account signed in to again, "" for a new one
+	user string
+}
+
+// SignInOptions are a sign-in's choices beyond its subscription.
+type SignInOptions struct {
+	Site string // where to sign in, for one with more than one (StartSignInAt)
+	// Proxy is the one to sign in through, as netproxy.With takes it ("" the
+	// global one, "direct" none, or its address); nil for the one the
+	// account's requests would go through. Picked, it is kept as the
+	// account's own once the sign-in is done.
+	Proxy *string
+	// User is the account signed in to again, for the proxy it goes through
+	User string
+}
+
+// via is ctx for the sign-in's requests: through its proxy, so the vendor
+// sees an account signed in from where its requests will come from, not
+// signed in through the global proxy and used through its own (#1663).
+func (s *signInFlow) via(ctx context.Context) context.Context {
+	return netproxy.With(ctx, s.proxy)
+}
+
+// pickProxy sets the proxy a sign-in to agent goes through.
+func (s *signInFlow) pickProxy(agent string, o SignInOptions) error {
+	s.user = strings.TrimSpace(o.User)
+	s.proxy = ProxyOfLogin(agent, s.user)
+	if o.Proxy == nil {
+		return nil
+	}
+	p := strings.TrimSpace(*o.Proxy)
+	if err := settings.CheckProxy(p); err != nil {
+		return err
+	}
+	s.proxy, s.chosen = p, true
+	return nil
 }
 
 var signIns = struct {
@@ -106,13 +171,26 @@ func StartSignIn(agent string) (SignInState, error) {
 // StartSignInAt is StartSignIn on one of the sites an agent signs in on:
 // ZCode's "zai" (the default) or "bigmodel".
 func StartSignInAt(agent, site string) (SignInState, error) {
+	return StartSignInWith(agent, SignInOptions{Site: site})
+}
+
+// StartSignInWith is StartSignIn with the sign-in's choices: its site and
+// the proxy it goes through.
+func StartSignInWith(agent string, o SignInOptions) (SignInState, error) {
+	site := o.Site
+	if settings.AccountDiscoveryOff() {
+		return SignInState{}, errAccountDiscoveryOff
+	}
 	// one moved onto its plugin signs in there: an account signed in to
 	// here would be the built-in's, which nothing serves now
 	if Moved(agent) {
 		return SignInState{}, fmt.Errorf("%s runs on its plugin: sign in through the plugin (magpie plugin login %s)", agent, agent)
 	}
 	s := &signInFlow{verifier: randomToken(48), state: randomToken(24), done: make(chan struct{}), site: site}
-	s.st = SignInState{ID: randomToken(9), Agent: agent, State: "waiting"}
+	if err := s.pickProxy(agent, o); err != nil {
+		return SignInState{}, err
+	}
+	s.st = SignInState{ID: randomToken(9), Agent: agent, State: "waiting", Proxy: s.proxy}
 	cli, install := missingCLI(agent)
 	var installing context.Context
 	if install {
@@ -193,19 +271,10 @@ func (s *signInFlow) begin() error {
 	q := url.Values{}
 	switch agent {
 	case "claude":
-		if ln, err = net.Listen("tcp", "127.0.0.1:0"); err != nil {
+		// Claude Code's own `claude auth login`: magpie makes no part of it
+		if err := startClaudeSignIn(s); err != nil {
 			return err
 		}
-		s.redirect = fmt.Sprintf("http://localhost:%d/callback", ln.Addr().(*net.TCPAddr).Port)
-		q.Set("code", "true")
-		q.Set("client_id", claudeClientID)
-		q.Set("response_type", "code")
-		q.Set("redirect_uri", s.redirect)
-		q.Set("scope", claudeScopes)
-		q.Set("code_challenge", challenge)
-		q.Set("code_challenge_method", "S256")
-		q.Set("state", s.state)
-		s.st.URL = claudeAuthorizeURL + "?" + q.Encode()
 	case "codex":
 		if ln, err = listenCodexCallback(); err != nil {
 			return err
@@ -223,6 +292,19 @@ func (s *signInFlow) begin() error {
 		q.Set("state", s.state)
 		q.Set("originator", "codex_cli_rs")
 		s.st.URL = codexAuthorizeURL + "?" + q.Encode()
+	case ChatGPTAPIID:
+		// OpenAI's Sign in with ChatGPT, which registers magpie on the way
+		if s.hostID, err = siwcHostID(); err != nil {
+			return err
+		}
+		if ln, err = listenSIWCCallback(); err != nil {
+			return err
+		}
+		s.redirect = fmt.Sprintf("http://127.0.0.1:%d/auth/callback", ln.Addr().(*net.TCPAddr).Port)
+		s.nonce = randomToken(24)
+		s.mu.Lock()
+		s.st.URL = siwcAuthorize(s.redirect, s.state, s.nonce, challenge, s.hostID)
+		s.mu.Unlock()
 	case "cursor":
 		// Cursor has no sign-in of its own to borrow: its CLI signs in
 		if err := startCursorSignIn(s); err != nil {
@@ -377,6 +459,15 @@ func SubmitSignInCallback(id, raw string) error {
 	if s.plugin != "" {
 		return s.pluginCode(raw)
 	}
+	if s.pluginPorts != nil {
+		return s.pluginCallback(raw)
+	}
+	if s.claude != nil {
+		return s.claudePaste(raw)
+	}
+	if s.status().Agent == CommandCodePlanID {
+		return s.commandCodeKey(raw)
+	}
 	return s.pastedCallback(raw)
 }
 
@@ -494,7 +585,7 @@ func (p *pastedReply) Write(b []byte) (int, error) {
 func (s *signInFlow) claim() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.st.State != "waiting" || s.claimed {
+	if s.st.State != "waiting" || s.claimed || s.finished {
 		return false
 	}
 	s.claimed = true
@@ -524,21 +615,33 @@ func (s *signInFlow) status() SignInState {
 	return s.st
 }
 
-// finish records the outcome once and lets the callback server go.
+// finish records the outcome once and lets the callback server go. A
+// sign-in done reads as done only once its account is shown again, so the
+// window, seeing it done, finds the account listed.
 func (s *signInFlow) finish(out SignInState) bool {
 	s.mu.Lock()
-	if s.st.State != "waiting" && s.st.State != "installing" {
+	if s.finished {
 		s.mu.Unlock()
 		return false
 	}
-	out.ID, out.Agent, out.URL, out.Code = s.st.ID, s.st.Agent, s.st.URL, s.st.Code
+	s.finished = true
+	if out.State == "done" {
+		agent, proxy, chosen := s.st.Agent, s.proxy, s.chosen
+		s.mu.Unlock()
+		// signing in again brings back an account removed from magpie
+		_ = ShowAccount(agent)
+		if chosen {
+			// the proxy picked for it is the account's from now on
+			if err := keepSignInProxy(agent, out.User, proxy); err != nil {
+				out.Error = "signed in, but its proxy wasn't kept: " + err.Error()
+			}
+		}
+		s.mu.Lock()
+	}
+	out.ID, out.Agent, out.URL, out.Code, out.Proxy = s.st.ID, s.st.Agent, s.st.URL, s.st.Code, s.st.Proxy
 	s.st = out
 	stop, srv := s.stop, s.srv
 	s.mu.Unlock()
-	if out.State == "done" {
-		// signing in again brings back an account removed from magpie
-		_ = ShowAccount(out.Agent)
-	}
 	close(s.done)
 	if stop != nil {
 		stop()
@@ -595,10 +698,14 @@ func (s *signInFlow) callback(w http.ResponseWriter, r *http.Request) {
 		signInPage(w, false, "This sign-in is already finishing", "magpie shows the account when it's done.")
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(s.via(r.Context()), 30*time.Second)
 	defer cancel()
 	if app, ok := googleAppOf(s.st.Agent); ok {
 		s.googleDone(ctx, w, app, q.Get("code"))
+		return
+	}
+	if s.st.Agent == ChatGPTAPIID {
+		s.siwcDone(ctx, w, q)
 		return
 	}
 	l, err := s.exchange(ctx, q.Get("code"))
@@ -651,19 +758,26 @@ func (s *signInFlow) exchange(ctx context.Context, code string) (savedLogin, err
 	switch s.st.Agent {
 	case "codex":
 		return codexExchange(ctx, code, s.verifier, s.redirect)
-	case "devin":
-		return devinExchange(ctx, code, s.verifier, s.redirect)
 	}
-	return claudeExchange(ctx, code, s.verifier, s.redirect, s.state)
+	return devinExchange(ctx, code, s.verifier, s.redirect)
 }
 
 func postToken(ctx context.Context, tokenURL, ctype string, body []byte, out any) error {
+	return postTokenAs(ctx, tokenURL, ctype, "", body, out)
+}
+
+// postTokenAs is postToken asked with bearer, a token already had, when it
+// isn't "" (Google's IAM Credentials, which trades one for another).
+func postTokenAs(ctx context.Context, tokenURL, ctype, bearer string, body []byte, out any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", ctype)
 	req.Header.Set("Accept", "application/json")
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return err
@@ -695,71 +809,19 @@ func postToken(ctx context.Context, tokenURL, ctype string, body []byte, out any
 		if msg == "" {
 			msg = http.StatusText(resp.StatusCode)
 		}
-		return fmt.Errorf("the sign-in was refused (%d): %s", resp.StatusCode, msg)
+		return &tokenRefused{resp.StatusCode, msg}
 	}
 	return json.Unmarshal(b, out)
 }
 
-func claudeExchange(ctx context.Context, code, verifier, redirect, state string) (savedLogin, error) {
-	body, _ := json.Marshal(map[string]string{"grant_type": "authorization_code", "code": code,
-		"redirect_uri": redirect, "client_id": claudeClientID, "code_verifier": verifier, "state": state})
-	var tok struct {
-		AccessToken  string `json:"access_token"`
-		RefreshToken string `json:"refresh_token"`
-		ExpiresIn    int64  `json:"expires_in"`
-		Scope        string `json:"scope"`
-		Account      struct {
-			UUID  string `json:"uuid"`
-			Email string `json:"email_address"`
-		} `json:"account"`
-		Organization struct {
-			UUID string `json:"uuid"`
-			Name string `json:"name"`
-		} `json:"organization"`
-	}
-	if err := postToken(ctx, claudeTokenURL, "application/json", body, &tok); err != nil {
-		return savedLogin{}, err
-	}
-	if tok.AccessToken == "" || tok.RefreshToken == "" {
-		return savedLogin{}, errors.New("Claude sent back no token")
-	}
-	acct := map[string]any{"accountUuid": tok.Account.UUID, "emailAddress": tok.Account.Email,
-		"organizationUuid": tok.Organization.UUID}
-	if tok.Organization.Name != "" {
-		acct["organizationName"] = tok.Organization.Name
-	}
-	c := claudeCredentials{raw: map[string]any{}, OAuth: claudeAuth{
-		AccessToken: tok.AccessToken, RefreshToken: tok.RefreshToken,
-		ExpiresAt: time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).UnixMilli(),
-		Scopes:    strings.Fields(tok.Scope),
-	}}
-	claudeProfileInto(ctx, &c, acct)
-	return claudeLogin(c, acct)
+// tokenRefused is a token endpoint's refusal, as postToken answers it.
+type tokenRefused struct {
+	status int
+	msg    string
 }
 
-// claudeProfileInto asks Claude for the account's profile and puts it in
-// acct (Claude Code's oauthAccount) and its plan in c; the plan comes with
-// the profile, as it does for Claude Code. It says whether Claude answered.
-func claudeProfileInto(ctx context.Context, c *claudeCredentials, acct map[string]any) bool {
-	p, err := claudeProfile(ctx, c.OAuth.AccessToken)
-	if err != nil {
-		return false
-	}
-	c.OAuth.SubscriptionType = claudePlans[p.Organization.Type]
-	c.OAuth.RateLimitTier = p.Organization.RateLimitTier
-	set := func(k, v string) {
-		if v != "" {
-			acct[k] = v
-		}
-	}
-	set("accountUuid", p.Account.UUID)
-	set("emailAddress", p.Account.Email)
-	set("displayName", p.Account.DisplayName)
-	set("organizationUuid", p.Organization.UUID)
-	set("organizationName", p.Organization.Name)
-	set("billingType", p.Organization.BillingType)
-	acct["hasExtraUsageEnabled"] = p.Organization.ExtraUsage
-	return true
+func (e *tokenRefused) Error() string {
+	return fmt.Sprintf("the sign-in was refused (%d): %s", e.status, e.msg)
 }
 
 // claudeLogin is a Claude sign-in as magpie keeps it.
@@ -774,44 +836,6 @@ func claudeLogin(c claudeCredentials, acct map[string]any) (savedLogin, error) {
 	}
 	profile, _ := json.Marshal(acct)
 	return savedLogin{Agent: "claude", User: claudeUser(email, c.OAuth.SubscriptionType, acct), Plan: c.OAuth.SubscriptionType, Auth: auth, Profile: profile}, nil
-}
-
-// claudePlans names Claude's organization types the way Claude Code does.
-var claudePlans = map[string]string{"claude_max": "max", "claude_pro": "pro", "claude_enterprise": "enterprise", "claude_team": "team"}
-
-type claudeProfileInfo struct {
-	Account struct {
-		UUID        string `json:"uuid"`
-		Email       string `json:"email"`
-		DisplayName string `json:"display_name"`
-	} `json:"account"`
-	Organization struct {
-		UUID          string `json:"uuid"`
-		Name          string `json:"name"`
-		Type          string `json:"organization_type"`
-		RateLimitTier string `json:"rate_limit_tier"`
-		BillingType   string `json:"billing_type"`
-		ExtraUsage    bool   `json:"has_extra_usage_enabled"`
-	} `json:"organization"`
-}
-
-func claudeProfile(ctx context.Context, token string) (claudeProfileInfo, error) {
-	var p claudeProfileInfo
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, claudeBase+"/api/oauth/profile", nil)
-	if err != nil {
-		return p, err
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return p, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return p, fmt.Errorf("profile: %s", resp.Status)
-	}
-	return p, json.NewDecoder(resp.Body).Decode(&p)
 }
 
 func codexExchange(ctx context.Context, code, verifier, redirect string) (savedLogin, error) {
@@ -857,14 +881,34 @@ func codexLogin(idToken, accessToken, refreshToken, accountID string) (savedLogi
 
 // addLogin keeps a freshly signed-in account. The agent is signed in to it
 // too when it has no account yet, or had this one: the new tokens replace
-// the old, so one refresh token stays in one place.
+// the old, so one refresh token stays in one place. Its kept usage
+// reading goes (StaleAllowance): it was read under the old sign-in, and
+// for a minute it would answer for the new one, a refusal and all.
 func addLogin(l savedLogin) (using bool, err error) {
+	defer func() { // under the name it is kept by (codexName), once loginsMu is let go
+		if err == nil {
+			StaleAllowance(l.Agent, l.User)
+		}
+	}()
 	loginsMu.Lock()
 	defer loginsMu.Unlock()
 	l.Seen = time.Now().UTC().Truncate(time.Second)
 	live, signedIn := liveLogin(l.Agent)
-	using = !signedIn || sameLogin(live, l)
 	ls := readLogins()
+	l.User = codexName(ls, l)
+	using = !signedIn || sameLogin(live, l)
+	if first := claudeStandIn(ls); !signedIn && l.Agent == "claude" && first != "" {
+		// logged out of Claude Code with accounts in magpie: it stays so,
+		// as the user left it (a claude.ai sign-in beside magpie's token
+		// has Claude Code warn), and the account is magpie's alone. The
+		// one served first till now, seen last, stays on behind it.
+		using = false
+		for i := range ls {
+			if ls[i].Agent == "claude" && strings.EqualFold(ls[i].User, first) && !ls[i].Paused && !sameLogin(ls[i], l) {
+				ls[i].On = true
+			}
+		}
+	}
 	if signedIn && !using {
 		// the current account, as fresh as the agent has it
 		live.Seen = l.Seen
@@ -886,6 +930,11 @@ func addLogin(l savedLogin) (using bool, err error) {
 		if err != nil {
 			return false, err
 		}
+	}
+	if l.Agent == "claude" {
+		// signed in afresh: what Claude Code kept for it beside the
+		// agent's own is an older sign-in, and gives way
+		forgetClaudeDir(l.User)
 	}
 	loginsSeenAt = time.Time{}
 	forgetAccountCaches()

@@ -15,6 +15,7 @@ func limitsHome(t *testing.T) {
 	t.Helper()
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
 	catalog.Reset()
@@ -702,5 +703,25 @@ func TestOutputChecksTheKeyItStores(t *testing.T) {
 	// no provider id to check it against
 	if err := SetModelOutput("not a model", 4096); err == nil {
 		t.Error("a key that names no provider and model was accepted")
+	}
+}
+
+// #1438: a reply limit is handed out within the window beside it, and an
+// unknown window or output, or one already within, is left as it is.
+func TestOutputWithin(t *testing.T) {
+	for _, c := range []struct{ window, output, want int }{
+		{256000, 500000, 256000}, // Grok's window, models.dev's output
+		{128000, 64000, 64000},   // within: unchanged
+		{128000, 128000, 128000}, // at the window: unchanged
+		{0, 500000, 500000},      // unknown window
+		{256000, 0, 0},           // unknown output
+		{0, 0, 0},
+	} {
+		if got := OutputWithin(c.window, c.output); got != c.want {
+			t.Errorf("OutputWithin(%d, %d) = %d, want %d", c.window, c.output, got, c.want)
+		}
+		if got := (Entry{Context: c.window, Output: c.output}).PublishedOutput(); got != c.want {
+			t.Errorf("PublishedOutput of %d/%d = %d, want %d", c.window, c.output, got, c.want)
+		}
 	}
 }

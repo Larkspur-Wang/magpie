@@ -15,6 +15,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/testenv"
 )
 
 // fakeJWT is a token whose payload is the given claims; nobody checks the
@@ -67,7 +70,7 @@ func signIn(t *testing.T) string {
 // logins and forgets anything a previous test cached.
 func isolate(t *testing.T) {
 	t.Helper()
-	oldKeychain, oldURL, oldBase, oldExe := claudeKeychain, claudeTokenURL, claudeBase, claudeExecutable
+	oldKeychain, oldBase, oldExe := claudeKeychain, claudeBase, claudeExecutable
 	oldCursor, oldDevin := cursorKeychain, DevinExecutable
 	claudeKeychain, cursorKeychain = false, false
 	claudeExecutable = func() string { return "" }
@@ -76,8 +79,13 @@ func isolate(t *testing.T) {
 	forgetClaudeCredential()
 	forgetClaudeStatus()
 	forgetDevinStatus()
+	// nor an account's allowance another test read, which LoginUsage and
+	// the Usage page share
+	loginUsageCache.Lock()
+	loginUsageCache.m, loginUsageCache.pending = nil, nil
+	loginUsageCache.Unlock()
 	t.Cleanup(func() {
-		claudeKeychain, claudeTokenURL, claudeBase, claudeExecutable = oldKeychain, oldURL, oldBase, oldExe
+		claudeKeychain, claudeBase, claudeExecutable = oldKeychain, oldBase, oldExe
 		cursorKeychain, DevinExecutable = oldCursor, oldDevin
 		forgetClaudeCredential()
 		forgetClaudeStatus()
@@ -154,6 +162,26 @@ func TestAccountsAreProviders(t *testing.T) {
 	if _, ok := find(All(), "codex"); ok {
 		t.Fatal("quieting brought codex back")
 	}
+	// hidden from the Add sheet too (#116): kept through a save, listed
+	// there again by untuck, still removed and quiet
+	if err := TuckAccount("codex", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := Save(Provider{ID: "codex", Models: []string{"gpt-5.5"}}); err != nil {
+		t.Fatal(err)
+	}
+	if x := Excluded(); len(x) != 1 || !x[0].Quiet || !x[0].Tucked {
+		t.Fatalf("tucked: %+v", x)
+	}
+	if err := TuckAccount("codex", false); err != nil {
+		t.Fatal(err)
+	}
+	if x := Excluded(); len(x) != 1 || !x[0].Quiet || x[0].Tucked {
+		t.Fatalf("untucked: %+v", x)
+	}
+	if err := TuckAccount("codex", true); err != nil {
+		t.Fatal(err)
+	}
 	if err := ShowAccount("codex"); err != nil {
 		t.Fatal(err)
 	}
@@ -222,6 +250,8 @@ func claudeHome(t *testing.T) string {
 	isolate(t)
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	// Windows finds the home in USERPROFILE
+	t.Setenv("USERPROFILE", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
 	forgetClaudeCredential()
@@ -232,19 +262,23 @@ func TestClaudeAccountIsProvider(t *testing.T) {
 	home := claudeHome(t)
 	creds := claudeSignIn(t, home, time.Now().Add(time.Hour))
 
-	// Anthropic lists its models live; magpie trusts that answer, not the binary.
-	models := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/models" || r.Header.Get("Authorization") != "Bearer sk-ant-oat01-old" {
-			w.WriteHeader(401)
-			return
-		}
-		json.NewEncoder(w).Encode(map[string]any{"has_more": false, "data": []any{
-			map[string]any{"id": "claude-sonnet-5", "display_name": "Claude Sonnet 5"},
-			map[string]any{"id": "claude-opus-5-5", "display_name": "Claude Opus 5.5"},
-		}})
+	// Claude's models are the catalog's: magpie asks Anthropic nothing with
+	// the account's sign-in, not even its model list
+	asked := false
+	anthropic := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		asked = true
+		w.WriteHeader(500)
 	}))
-	defer models.Close()
-	claudeBase = models.URL
+	defer anthropic.Close()
+	claudeBase = anthropic.URL
+	os.MkdirAll(filepath.Dir(catalog.CachePath()), 0o755)
+	if err := os.WriteFile(catalog.CachePath(), []byte(`{"anthropic": {"models": {
+	  "claude-sonnet-5": {"id":"claude-sonnet-5","name":"Claude Sonnet 5","modalities":{"input":["text"],"output":["text"]}},
+	  "claude-opus-5-5": {"id":"claude-opus-5-5","name":"Claude Opus 5.5","modalities":{"input":["text"],"output":["text"]}}}}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	catalog.Reset()
+	t.Cleanup(catalog.Reset)
 
 	p, ok := find(All(), "claude")
 	if !ok || p.Account == nil || p.Account.User != "Claude Max" || p.Account.Plan != "max" || !p.Ready() {
@@ -254,13 +288,11 @@ func TestClaudeAccountIsProvider(t *testing.T) {
 		t.Fatalf("endpoints: %+v", p)
 	}
 
-	// nothing is compiled in: before a fetch there is nothing to show, and
-	// afterwards exactly what the vendor listed, "Opus 5.5" included
-	if got := len(p.Available()); got != 0 {
+	if got := len(p.Available()); got != 2 {
 		t.Fatalf("available before a fetch: %d", got)
 	}
-	if ms, err := p.Fetch(context.Background()); err != nil || len(ms) != 2 {
-		t.Fatalf("fetch: %v %v", ms, err)
+	if ms, err := p.Fetch(context.Background()); err != nil || len(ms) != 2 || asked {
+		t.Fatalf("fetch: %v %v asked Anthropic: %v", ms, err, asked)
 	}
 	p, _ = find(All(), "claude")
 	if at, ok := p.Fetched(); !ok || time.Since(at) > time.Minute {
@@ -306,47 +338,6 @@ func TestClaudeAccountIsProvider(t *testing.T) {
 	forgetClaudeCredential()
 	if _, ok := find(All(), "claude"); ok {
 		t.Fatal("claude still listed after sign-out")
-	}
-}
-
-func TestClaudeRefreshesToken(t *testing.T) {
-	home := claudeHome(t)
-	creds := claudeSignIn(t, home, time.Now().Add(-time.Minute))
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var body map[string]string
-		json.NewDecoder(r.Body).Decode(&body)
-		if body["grant_type"] != "refresh_token" || body["client_id"] != claudeClientID || body["refresh_token"] != "sk-ant-ort01-old" {
-			w.WriteHeader(400)
-			return
-		}
-		json.NewEncoder(w).Encode(map[string]any{"access_token": "sk-ant-oat01-new", "refresh_token": "sk-ant-ort01-new", "expires_in": 3600})
-	}))
-	defer srv.Close()
-	claudeTokenURL = srv.URL
-
-	if tok, err := claudeToken(context.Background()); err != nil || tok != "sk-ant-oat01-new" {
-		t.Fatalf("token: %q %v", tok, err)
-	}
-
-	// the rotated pair is written back where Claude Code will find it, and
-	// everything else in the file survives
-	var raw map[string]any
-	if !readJSON(creds, &raw) {
-		t.Fatalf("credentials unreadable: %s", creds)
-	}
-	oauth, _ := raw["claudeAiOauth"].(map[string]any)
-	if oauth["accessToken"] != "sk-ant-oat01-new" || oauth["refreshToken"] != "sk-ant-ort01-new" || oauth["subscriptionType"] != "max" {
-		t.Fatalf("oauth: %v", oauth)
-	}
-	if exp, _ := oauth["expiresAt"].(float64); exp <= float64(time.Now().UnixMilli()) {
-		t.Fatalf("expiry not advanced: %v", oauth["expiresAt"])
-	}
-	if mcp, _ := raw["mcpOAuth"].(map[string]any); mcp == nil {
-		t.Fatalf("mcpOAuth lost: %v", raw)
-	}
-	if b, _ := os.ReadFile(creds); strings.Contains(string(b), "sk-ant-ort01-old") {
-		t.Fatalf("old refresh token kept: %s", b)
 	}
 }
 
@@ -457,15 +448,76 @@ func TestCopilotSignAndModels(t *testing.T) {
 	}
 }
 
+// Copilot lists GPT-4.1, GPT-4o and the models before them with no
+// supported_endpoints, and serves them on chat completions alone: asked on
+// /v1/messages, Copilot answers "no model endpoints available given user
+// constraints", which read as the plan's refusal (#754: an Education
+// account's copilot/gpt-4o from Claude Code). They are asked on Chat, a
+// model the list names for no picker (gpt-4o) too.
+func TestCopilotModelsWithoutEndpointsOnChat(t *testing.T) {
+	signIn(t)
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/models" {
+			w.Write([]byte(`{"data":[
+			  {"id":"claude-haiku-4.5","name":"Claude Haiku 4.5","model_picker_enabled":true,"model_picker_category":"lightweight","policy":{"state":"enabled"},"supported_endpoints":["/chat/completions","/v1/messages"],"capabilities":{"type":"chat"}},
+			  {"id":"gpt-4.1","name":"GPT-4.1","model_picker_enabled":false,"model_picker_category":"versatile","policy":{"state":"enabled"},"capabilities":{"type":"chat"}},
+			  {"id":"gpt-4o","name":"GPT-4o","model_picker_enabled":false,"capabilities":{"type":"chat"}},
+			  {"id":"text-embedding-3-small","name":"Emb","model_picker_enabled":false,"capabilities":{"type":"embeddings"}}]}`))
+			return
+		}
+		w.WriteHeader(404)
+	}))
+	defer api.Close()
+	tokens := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"token": "sess", "expires_at": time.Now().Add(time.Hour).Unix(), "endpoints": map[string]string{"api": api.URL}})
+	}))
+	defer tokens.Close()
+	old := CopilotTokenURL
+	CopilotTokenURL = tokens.URL
+	defer func() { CopilotTokenURL = old }()
+	copilotSessions = map[string]copilotSession{}
+	copilotSeenMu.Lock()
+	copilotSeen = map[string][]string{}
+	copilotSeenMu.Unlock()
+
+	p, _ := find(All(), "copilot")
+	if _, err := p.Fetch(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	p, _ = find(All(), "copilot")
+	for model, want := range map[string]string{
+		"claude-haiku-4.5": "chat anthropic",
+		"gpt-4.1":          "chat", // listed
+		"gpt-4o":           "chat", // not listed, and asked for by hand
+	} {
+		var got []string
+		for _, a := range p.APIs(model) {
+			got = append(got, string(a))
+		}
+		if strings.Join(got, " ") != want {
+			t.Errorf("APIs(%s) = %v, want %s", model, got, want)
+		}
+	}
+	// what Copilot's /v1/messages said is kept, and said not to be the plan
+	msg := p.Explain("Copilot: 400 Bad Request: no model endpoints available given user constraints", 400, []byte("no model endpoints available given user constraints\n"))
+	if !strings.Contains(msg, "no model endpoints available given user constraints") || !strings.Contains(msg, "Anthropic's Messages API") {
+		t.Errorf("explained: %s", msg)
+	}
+	if got := p.Explain("Copilot: 400", 400, []byte(`{"error":{"code":"model_not_supported"}}`)); got != "Copilot: 400" {
+		t.Errorf("a refusal of the model was explained as the API's: %s", got)
+	}
+}
+
 // Logging out of Claude Code can leave its credentials behind; what the CLI
 // says wins, so a signed-out account is not a provider.
 func TestClaudeSignedOut(t *testing.T) {
+	shellFakes(t)
 	home := claudeHome(t)
 	claudeSignIn(t, home, time.Now().Add(time.Hour))
 	status := `{"loggedIn": true, "email": "me@example.com", "subscriptionType": "max"}`
 	exe := filepath.Join(home, "claude")
 	fake := func() {
-		os.WriteFile(exe, []byte("#!/bin/sh\ncat <<'X'\n"+status+"\nX\n"), 0o755)
+		testenv.Program(t, exe, "#!/bin/sh\ncat <<'X'\n"+status+"\nX\n")
 		forgetClaudeStatus()
 	}
 	claudeExecutable = func() string { return exe }
@@ -503,8 +555,12 @@ func TestCopilotAPIs(t *testing.T) {
 	if strings.Join(got, " ") != "responses anthropic chat" {
 		t.Errorf("copilotAPIs = %v", got)
 	}
-	if copilotAPIs(nil) != nil {
-		t.Error("no endpoints should be not known")
+	// a model listed with no supported_endpoints (GPT-4.1, GPT-4o) is
+	// served on chat completions alone (#754)
+	for _, none := range [][]string{nil, {}} {
+		if got := copilotAPIs(none); strings.Join(got, " ") != "chat" {
+			t.Errorf("copilotAPIs(%#v) = %v, want chat", none, got)
+		}
 	}
 }
 
@@ -526,5 +582,31 @@ func TestKeychainText(t *testing.T) {
 	}
 	if _, wasHex := keychainText([]byte("abcd")); wasHex {
 		t.Fatal("hex that isn't JSON taken")
+	}
+}
+
+// The cached credentials are handed out by value, but their raw blob is one
+// map: marshal is called on it from several goroutines at once (the
+// gateway's limitHeaders beside a run's own read, CI's -race on 01e66e0f),
+// so it must not write into it.
+func TestClaudeCredentialsMarshalLeavesTheBlob(t *testing.T) {
+	c, ok := parseClaudeCredentials([]byte(`{"claudeAiOauth":{"accessToken":"sk-ant-oat01-a","refreshToken":"sk-ant-ort01-a","expiresAt":1},"mcpOAuth":{"x":{"accessToken":"m"}}}`))
+	if !ok {
+		t.Fatal("not parsed")
+	}
+	c.OAuth.AccessToken, c.OAuth.SubscriptionType = "sk-ant-oat01-b", "max"
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if b, err := c.marshal(); err != nil || !strings.Contains(string(b), "sk-ant-oat01-b") || !strings.Contains(string(b), "mcpOAuth") {
+				t.Errorf("marshal %s %v", b, err)
+			}
+		}()
+	}
+	wg.Wait()
+	if o := c.raw["claudeAiOauth"].(map[string]any); o["accessToken"] != "sk-ant-oat01-a" || o["subscriptionType"] != nil {
+		t.Fatalf("the blob was written into: %v", o)
 	}
 }

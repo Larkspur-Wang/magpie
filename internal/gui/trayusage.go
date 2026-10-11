@@ -3,6 +3,7 @@ package gui
 import (
 	"cmp"
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"regexp"
@@ -14,11 +15,12 @@ import (
 	"github.com/yetone/magpie/internal/settings"
 )
 
-// Settings → Usage in the menu bar: the windows of the subscriptions and
+// Settings → Allowances in the menu bar: the windows of the subscriptions and
 // plans ticked there, beside the tray icon, for keeping an eye on them
 // without opening magpie. The Mac's menu bar draws each as its logo with
-// its two windows stacked, "42%" over "18%", side by side (trayimage); a
-// tray elsewhere gets them as text ("42% · 18% | 10% · 5%"), Windows' in
+// its two windows stacked, "42%" over "18%", side by side (trayimage), or
+// as the windows alone, a thin line between cards, when Settings turns the
+// logos off; a tray elsewhere gets them as text ("42% · 18% | 10% · 5%"), Windows' in
 // the icon's tooltip only, having no room for any.
 
 // trayUsageEvery is how often the text is brought up to date, as Settings
@@ -61,6 +63,7 @@ func trayWindows(q provider.SubscriptionQuota) []provider.QuotaWindow {
 // spells it out: each window's use, or what is left of it (left), and when
 // it starts again.
 func trayUsageText(q provider.SubscriptionQuota, now time.Time, left bool) (label, tip string) {
+	q.Name = trayName(q)
 	if q.Error != "" {
 		return "", q.Name + ": " + q.Error
 	}
@@ -69,7 +72,7 @@ func trayUsageText(q provider.SubscriptionQuota, now time.Time, left bool) (labe
 		if q.Balance == "" {
 			return "", ""
 		}
-		return q.Balance, q.Name + " · " + q.Balance
+		return q.Balance, q.Name + " · " + q.Balance + trayAsOf(q)
 	}
 	var short, long []string
 	for _, w := range ws {
@@ -87,8 +90,8 @@ func trayUsageText(q provider.SubscriptionQuota, now time.Time, left bool) (labe
 			tipPct = fmt.Sprintf("%.1f%%", used)
 		}
 		line := w.Name + " " + tipPct + " " + word
-		if w.Display != "" {
-			line = w.Name + " " + w.Display + " · " + tipPct + " " + word
+		if c := w.Count(left); c != "" {
+			line = w.Name + " " + c + " · " + tipPct + " " + word
 		}
 		if at := resetAt(w, now); !at.IsZero() && at.After(now) {
 			line += " · resets in " + until(at.Sub(now))
@@ -98,7 +101,17 @@ func trayUsageText(q provider.SubscriptionQuota, now time.Time, left bool) (labe
 	if len(short) > 2 {
 		short = short[:2]
 	}
-	return strings.Join(short, " · "), q.Name + "\n" + strings.Join(long, "\n")
+	return strings.Join(short, " · "), q.Name + "\n" + strings.Join(long, "\n") + trayAsOf(q)
+}
+
+// trayAsOf is the tooltip's word that a card stands in for one that
+// couldn't be read just now, and when it was read (the Usage page's
+// "As of …"); nothing for a reading just made.
+func trayAsOf(q provider.SubscriptionQuota) string {
+	if q.AsOf == nil {
+		return ""
+	}
+	return "\nas of " + q.AsOf.Local().Format("Jan 2 15:04") + ", couldn't be read just now"
 }
 
 func resetAt(w provider.QuotaWindow, now time.Time) time.Time {
@@ -130,14 +143,14 @@ func trayUsageCards(ctx context.Context, ids []string) []provider.SubscriptionQu
 	if len(ids) == 0 {
 		return nil
 	}
-	return trayPick(provider.Quotas(ctx), ids)
+	return trayPick(provider.Quotas(ctx), ids, time.Now())
 }
 
-func trayPick(cards []provider.SubscriptionQuota, ids []string) []provider.SubscriptionQuota {
+func trayPick(cards []provider.SubscriptionQuota, ids []string, now time.Time) []provider.SubscriptionQuota {
 	var out []provider.SubscriptionQuota
 	for _, id := range ids {
 		if pid, ok := strings.CutSuffix(id, trayInUse); ok {
-			if q, ok := trayInUseCard(cards, pid); ok {
+			if q, ok := trayInUseCard(cards, pid, now); ok {
 				out = append(out, q)
 			}
 			continue
@@ -151,17 +164,28 @@ func trayPick(cards []provider.SubscriptionQuota, ids []string) []provider.Subsc
 
 // trayInUse ends a card id that follows a subscription's account in use
 // ("claude|*") rather than naming one: with several accounts, the one the
-// gateway goes to first is the one worth watching, whichever it is now.
+// gateway is sending to is the one worth watching, whichever it is now.
 const trayInUse = "|*"
 
 // trayInUseAccount is the account of an agent's the gateway goes to first;
 // a var for tests.
 var trayInUseAccount = provider.InUseLogin
 
+// trayServedFresh is how lately an account must have answered through the
+// gateway for the menu bar to take it as the one in use; a var for tests.
+var trayServedFresh = time.Hour
+
 // trayInUseCard is the card of the provider's account in use, named with
-// the account so the tooltip says which it is; the provider's first card
-// when magpie can't tell (the account in use first among them).
-func trayInUseCard(cards []provider.SubscriptionQuota, pid string) (provider.SubscriptionQuota, bool) {
+// the account so the tooltip says which it is: the one that answered a
+// request through the gateway last, within trayServedFresh — the gateway
+// moves on from a spent account, and under Smart picks any, as soon as it
+// asks, which the account the agent is signed in to can lag (okingkee on
+// X: A used up, B answering, the menu bar still on A) — else the one
+// InUseLogin reckons the gateway goes to first; else the one that answered
+// last at all (a plugin's accounts, which InUseLogin doesn't know); the
+// provider's first card when magpie can't tell (the account in use first
+// among them).
+func trayInUseCard(cards []provider.SubscriptionQuota, pid string, now time.Time) (provider.SubscriptionQuota, bool) {
 	var mine []provider.SubscriptionQuota
 	for _, q := range cards {
 		if q.Provider == pid {
@@ -173,32 +197,67 @@ func trayInUseCard(cards []provider.SubscriptionQuota, pid string) (provider.Sub
 	}
 	q := mine[0]
 	if len(mine) > 1 {
-		if user := trayInUseAccount(pid); user != "" {
-			if i := slices.IndexFunc(mine, func(q provider.SubscriptionQuota) bool { return strings.EqualFold(q.User, user) }); i >= 0 {
-				q = mine[i]
+		last := -1
+		for i, c := range mine {
+			if c.LastServedAt != nil && (last < 0 || c.LastServedAt.After(*mine[last].LastServedAt)) {
+				last = i
 			}
 		}
+		in := -1
+		if user := trayInUseAccount(pid); user != "" {
+			in = slices.IndexFunc(mine, func(q provider.SubscriptionQuota) bool { return strings.EqualFold(q.User, user) })
+		}
+		switch {
+		case last >= 0 && now.Sub(*mine[last].LastServedAt) < trayServedFresh:
+			q = mine[last]
+		case in >= 0:
+			q = mine[in]
+		case last >= 0:
+			// a plugin's accounts are no sign-in InUseLogin knows (#1516):
+			// the one that answered last, however long ago, over the first
+			q = mine[last]
+		}
 	}
-	if q.User != "" {
-		q.Name += " · " + q.User
+	if q.User != "" && q.Alias == "" {
+		q.Name += " · " + q.User // a named account's name is trayName's
 	}
 	return q, true
+}
+
+// trayName is how the tooltip names a card: by the name the user gave its
+// account, or the key plan it stands in for, after the card's (#1515).
+func trayName(q provider.SubscriptionQuota) string {
+	if q.Alias != "" {
+		return q.Name + " · " + q.Alias
+	}
+	return q.Name
 }
 
 // trayCell is a card as the Mac's menu bar draws it: its logo, and its
 // label's parts stacked, the shortest window over the longer ("42%" over
 // "18%"), or its balance alone.
 type trayCell struct {
+	ID     string // stable provider/account identity, captured with the drawn cell
 	Icon   []byte // the logo as the Usage page has it (SVG or PNG); nil for none
 	Mono   bool   // a black glyph, drawn in the menu bar's text colour
 	Letter string // drawn in its place when there is no logo, or it can't be read
+	Plain  bool   // no logo nor letter, as Settings says: the rows alone, a line before
 	Rows   []string
 }
 
+// trayPlain are the cells without their logos (settings.TrayNoLogos):
+// each its rows alone, told from the one before it by a thin line.
+func trayPlain(cells []trayCell) []trayCell {
+	out := make([]trayCell, len(cells))
+	for i, c := range cells {
+		out[i] = trayCell{ID: c.ID, Plain: true, Rows: c.Rows}
+	}
+	return out
+}
+
 // trayUsageView is what the tray shows for the cards: a cell for each
-// that has a label; the labels as one line of text, " | " between cards,
-// for a tray that shows text and not the cells; and the tooltip spelling
-// each out.
+// that has a label, with its stable identity for clicks; labels joined by
+// " | " for a tray that shows text; and a tooltip spelling each out.
 func trayUsageView(cards []provider.SubscriptionQuota, now time.Time, left bool) (cells []trayCell, label, tip string) {
 	var labels, tips []string
 	for _, q := range cards {
@@ -210,7 +269,7 @@ func trayUsageView(cards []provider.SubscriptionQuota, now time.Time, left bool)
 			continue
 		}
 		labels = append(labels, l)
-		c := trayCell{Rows: strings.Split(l, " · ")}
+		c := trayCell{ID: trayCardID(q), Rows: strings.Split(l, " · ")}
 		for i, r := range c.Rows {
 			c.Rows[i] = trayRow(r)
 		}
@@ -221,6 +280,14 @@ func trayUsageView(cards []provider.SubscriptionQuota, now time.Time, left bool)
 		cells = append(cells, c)
 	}
 	return cells, strings.Join(labels, " | "), strings.Join(tips, "\n\n")
+}
+
+// sniTip is the tooltip as a Linux tray item's ToolTip title carries it.
+// Omarchy's bar shows the title as plain text and waybar as Pango markup,
+// where a bare "&" or "<" loses the whole tooltip; their look-alikes read
+// the same in both.
+func sniTip(tip string) string {
+	return strings.NewReplacer("&", "＆", "<", "‹", ">", "›").Replace(tip)
 }
 
 // trayRow is a cell's row cut to fit the menu bar: a balance is a few
@@ -332,3 +399,13 @@ func svgNumber(d string, i int) int {
 // onTrayUsage brings the tray's text up to date at once, when the Settings
 // page changes which card it shows; set by the process that has the tray.
 var onTrayUsage func()
+
+// onTrayCellClick receives the stable card ID from the native image.
+// Set by the tray process; it must schedule window work without blocking.
+var onTrayCellClick func(id string)
+
+// panelQuotaJS safely quotes the card ID for the panel's focus handler.
+func panelQuotaJS(card string) string {
+	id, _ := json.Marshal(card) // quoted and escaped: a JSON string is a JS one
+	return "panelQuotaFocus(" + string(id) + ")"
+}

@@ -3,7 +3,7 @@ package agent
 // An agent's command-line program is kept up to date from the Agents page
 // (#202): its version, the newest there is, and a click that updates it the
 // way it was installed — with the CLI's own updater where it came from the
-// vendor's installer (claude update, codex update, opencode upgrade), or by
+// vendor's installer (claude update, codex update, opencode upgrade, grok update), or by
 // the package manager that owns it (npm, bun, pnpm, Homebrew). How it was
 // installed is read from where its binary is; when that says nothing sure,
 // the version is shown and nothing offered.
@@ -25,8 +25,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/netproxy"
 	"github.com/yetone/magpie/internal/proc"
+	"github.com/yetone/magpie/internal/source"
+	"github.com/yetone/magpie/internal/update"
 )
 
 // CLI is what magpie knows of an agent's command-line program.
@@ -42,6 +45,24 @@ type CLI struct {
 	Command string `json:"command,omitempty"`
 	// Update: Latest is after Version, and magpie knows how to get it
 	Update bool `json:"update,omitempty"`
+	// App is the version of the agent's desktop app installed beside it
+	// (the Codex app, AppVersion); shown even with no CLI on PATH
+	App string `json:"app,omitempty"`
+	// Admin: the update needs an administrator, which Windows asks for
+	// first (npm's global folder under Program Files)
+	Admin bool `json:"admin,omitempty"`
+	// Path is where the CLI was found: the file magpie runs, as PATH
+	// reached it
+	Path string `json:"path,omitempty"`
+	// OffPath says the CLI was found in a folder magpie adds to its own
+	// PATH (proc.UserPath: ~/.local/bin, npm's prefixes, nvm's default
+	// Node, bun, Homebrew, ...) that a terminal opened now doesn't have,
+	// so that `which` there doesn't find it. A row of an agent the user
+	// believed uninstalled, with a version and nothing to say where it
+	// came from, read as magpie making it up (悠悠哥 on Discord: Codex
+	// 0.162.1 listed with no codex on PATH and no ~/.codex). False when
+	// the terminal's PATH can't be told.
+	OffPath bool `json:"offPath,omitempty"`
 }
 
 // cliSpec is where an agent's CLI is published.
@@ -52,6 +73,13 @@ type cliSpec struct {
 	// links lead, with forward slashes) is the one its vendor's installer
 	// put there
 	self func(bin, real string) []string
+	// at is where its vendor's installer puts the CLI under the home folder
+	// (.exe added on Windows), for an agent with no Bin: its command's name
+	// is other tools' too, so PATH can't say it is this one
+	at string
+	// latest is the newest version its own updater would install, for one
+	// not published on npm
+	latest func() string
 }
 
 var cliSpecs = map[string]cliSpec{
@@ -66,7 +94,9 @@ var cliSpecs = map[string]cliSpec{
 		}},
 	"codex": {npm: []string{"@openai/codex"}, brew: []string{"codex"},
 		self: func(bin, real string) []string {
-			// its standalone installer's ~/.codex/packages/standalone/releases/…
+			// its standalone installer's ~/.codex/packages/standalone/releases/…,
+			// reached on Windows through install.ps1's junctions
+			// (%LOCALAPPDATA%\Programs\OpenAI\Codex\bin → …\current\bin)
 			if strings.Contains(real, "/.codex/packages/standalone/") {
 				return []string{bin, "update"}
 			}
@@ -80,12 +110,33 @@ var cliSpecs = map[string]cliSpec{
 			}
 			return nil
 		}},
-	"pi":      {npm: []string{"@earendil-works/pi-coding-agent", "@mariozechner/pi-coding-agent"}},
-	"omp":     {npm: []string{"@oh-my-pi/pi-coding-agent"}},
-	"copilot": {npm: []string{"@github/copilot"}, brew: []string{"copilot-cli"}},
-	"crush":   {npm: []string{"@charmland/crush"}, brew: []string{"crush"}},
-	"cline":   {npm: []string{"cline"}},
-	"goose":   {brew: []string{"block-goose-cli"}},
+	// Grok Build: x.ai/cli/install.sh links ~/.grok/bin/grok to
+	// ../downloads/grok-<platform>, and grok update to a new
+	// ../downloads/grok-<version>-<platform>; install.ps1 copies grok.exe
+	// into ~\.grok\bin itself, as grok update does again. grok is also
+	// Homebrew's regular-expression tool, hence at.
+	"grok": {at: ".grok/bin/grok", latest: grokLatest,
+		self: func(bin, real string) []string {
+			if l := strings.ToLower(real); strings.Contains(l, "/.grok/bin/") || strings.Contains(l, "/.grok/downloads/") {
+				return []string{bin, "update"}
+			}
+			return nil
+		}},
+	"pi":        {npm: []string{"@earendil-works/pi-coding-agent", "@mariozechner/pi-coding-agent"}},
+	"omp":       {npm: []string{"@oh-my-pi/pi-coding-agent"}},
+	"copilot":   {npm: []string{"@github/copilot"}, brew: []string{"copilot-cli"}},
+	"crush":     {npm: []string{"@charmland/crush"}, brew: []string{"crush"}},
+	"cline":     {npm: []string{"cline"}},
+	"dsh":       {npm: []string{"@deepseek-ai/dsh"}},
+	"codebuddy": {npm: []string{"@tencent-ai/codebuddy-code"}},
+	"goose":     {brew: []string{"block-goose-cli"}},
+	// AtomCode's installer chooses /usr/local/bin or ~/.local/bin by
+	// writability (`.local\bin\atomcode.exe` on Windows); `atomcode upgrade`
+	// exists, but its installed-binary update path is not exercised here, so
+	// only its npm package and brew cask are recognized
+	"atomcode": {npm: []string{"@atomgit.com/atomcode"}, brew: []string{"atomcode"}},
+	// Snow CLI is published on npm alone (snow-ai)
+	"snow": {npm: []string{"snow-ai"}},
 	// omo update, however it was installed: OmO's own updater, which moves
 	// the engine it pins (senpi) with it
 	"omo": {npm: []string{"omo-ai"},
@@ -100,6 +151,15 @@ type updater struct {
 	brew string   // the brew that has it
 	cmd  []string // the update
 	path string   // a folder to put first on PATH for it (its npm's node)
+	// admin: npm's global folder (prefix) is one only an administrator can
+	// change, so the update runs after Windows' administrator prompt
+	admin  bool
+	prefix string
+	// latest is the newest its own updater would install (cliSpec.latest)
+	latest func() string
+	// reshim is run after the update: the version manager whose shim the
+	// CLI was found as making shims for what it installed
+	reshim []string
 }
 
 // shown is the update as a person would type it.
@@ -118,7 +178,7 @@ var brewPath = regexp.MustCompile(`/(Cellar|Caskroom)/([^/]+)/`)
 // howInstalled says how the CLI at bin was installed, from where it is;
 // nil when that says nothing sure.
 func howInstalled(spec cliSpec, bin string) *updater {
-	real, err := filepath.EvalSymlinks(bin)
+	real, err := proc.RealPath(bin)
 	if err != nil {
 		real = bin
 	}
@@ -129,7 +189,7 @@ func howInstalled(spec cliSpec, bin string) *updater {
 			if len(spec.npm) > 0 {
 				pkg = spec.npm[0]
 			}
-			return &updater{via: "self", pkg: pkg, cmd: c}
+			return &updater{via: "self", pkg: pkg, cmd: c, latest: spec.latest}
 		}
 	}
 	// a package manager's before Homebrew's: npm under Homebrew's node
@@ -211,10 +271,15 @@ func fromNodeModules(pkg, bin, real string) *updater {
 		prefix = filepath.Dir(prefix)
 		npm = filepath.Join(prefix, "bin", "npm")
 	}
-	if !writable(m) {
-		return nil // the system's (/usr/lib): npm would want sudo
+	u := &updater{via: "npm", pkg: pkg, prefix: prefix}
+	if !canWrite(m) {
+		if !adminNPM {
+			return nil // the system's (/usr/lib): npm would want sudo
+		}
+		// Node.js's own folder, C:\Program Files\nodejs, where npm's
+		// prefix was left there (新v学员 on Discord)
+		u.admin = true
 	}
-	u := &updater{via: "npm", pkg: pkg}
 	if isFile(npm) {
 		u.path = filepath.Dir(npm) // its own node, not another on PATH
 	} else {
@@ -376,9 +441,11 @@ func (m *memo) forget(key string) {
 var versions, latests memo
 
 // installedVersion is what the CLI at bin says its version is, asked again
-// only once the binary changes.
+// only once the binary changes: the file its links and junctions lead to,
+// its size or its time (an update's release folder is a new path even where
+// the archive gave every version's binary the same time).
 func installedVersion(bin string) string {
-	real, err := filepath.EvalSymlinks(bin)
+	real, err := proc.RealPath(bin)
 	if err != nil {
 		real = bin
 	}
@@ -396,22 +463,18 @@ func installedVersion(bin string) string {
 	})
 }
 
-// runVersion runs bin --version with nothing on its stdin; a var so tests
-// can fake it.
-var runVersion = func(bin string) string {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	cmd := proc.CommandContext(ctx, bin, "--version")
-	cmd.Stdin = nil // /dev/null: one that would ask something gets nothing
-	cmd.Env = append(os.Environ(), "NO_COLOR=1")
-	out, _ := cmd.CombinedOutput()
-	return string(out)
-}
+// runVersion is what bin says its version is (proc.Version: read from its
+// npm package, else bin --version, not run again after it failed); a var so
+// tests can fake it.
+var runVersion = proc.Version
 
 // latestVersion is the newest version where u would update from.
 func latestVersion(u *updater) string {
 	if u.via == "brew" {
 		return latests.get("brew:"+u.pkg, "", 6*time.Hour, 15*time.Minute, func() (string, error) { return brewLatest(u) })
+	}
+	if u.latest != nil {
+		return u.latest()
 	}
 	if u.pkg == "" {
 		return ""
@@ -427,7 +490,7 @@ func npmLatest(pkg string) (string, error) {
 	req, _ := http.NewRequest("GET", npmRegistry+pkg+"/latest", nil)
 	req.Header.Set("User-Agent", "magpie")
 	req.Header.Set("Accept", "application/json")
-	resp, err := c.Do(req)
+	resp, err := source.Do(c, req)
 	if err != nil {
 		return "", err
 	}
@@ -443,6 +506,60 @@ func npmLatest(pkg string) (string, error) {
 		return "", errors.New("no version")
 	}
 	return r.Version, nil
+}
+
+// grokReleases is where Grok's installers and grok update read the newest
+// version of a channel (x.ai/cli/stable), in front of
+// storage.googleapis.com/grok-build-public-artifacts/cli; a var so tests can
+// serve one.
+var grokReleases = []string{"https://x.ai/cli/", "https://storage.googleapis.com/grok-build-public-artifacts/cli/"}
+
+// grokLatest is the newest Grok Build of the channel it follows: the
+// installer's GROK_CHANNEL or grok update --alpha, kept under [cli] in its
+// config.toml (stable when none).
+func grokLatest() string {
+	dir := os.Getenv("GROK_HOME")
+	if dir == "" {
+		home, _ := os.UserHomeDir()
+		dir = filepath.Join(home, ".grok")
+	}
+	channel := "stable"
+	if cli, _ := edit.GetTOMLTable(filepath.Join(dir, "config.toml"), "cli"); cli["channel"] == "alpha" || cli["channel"] == "enterprise" {
+		channel = cli["channel"]
+	}
+	return latests.get("grok:"+channel, "", 6*time.Hour, 15*time.Minute, func() (v string, err error) {
+		for _, base := range grokReleases {
+			if v, err = channelVersion(base + channel); err == nil {
+				return v, nil
+			}
+		}
+		return "", err
+	})
+}
+
+// channelVersion is the version a release channel's pointer file names.
+func channelVersion(url string) (string, error) {
+	c := &http.Client{Timeout: 8 * time.Second}
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("User-Agent", "magpie")
+	resp, err := source.Do(c, req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("%s answered %s", url, resp.Status)
+	}
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 256))
+	if err != nil {
+		return "", err
+	}
+	// the whole body is the version: 1.0.50
+	v := strings.TrimSpace(string(b))
+	if v == "" || parseVersion(" "+v) != strings.TrimPrefix(v, "v") {
+		return "", fmt.Errorf("%s: no version", url)
+	}
+	return strings.TrimPrefix(v, "v"), nil
 }
 
 // brewLatest is the version Homebrew has for u, as it last updated itself:
@@ -482,15 +599,50 @@ var brewLatest = func(u *updater) (string, error) {
 	return v, nil
 }
 
+// loginPath is the PATH a terminal opened now has (proc.LoginPath); a var
+// so tests can fake it.
+var loginPath = proc.LoginPath
+
+// offPath reports whether bin's folder is none of dirs, a terminal's PATH;
+// false when dirs is nil, a PATH that can't be told.
+func offPath(bin string, dirs []string) bool {
+	if dirs == nil {
+		return false
+	}
+	at := filepath.Clean(filepath.Dir(bin))
+	for _, d := range dirs {
+		if d == "" {
+			continue
+		}
+		if abs, err := filepath.Abs(d); err == nil {
+			d = abs
+		}
+		if strings.EqualFold(filepath.Clean(d), at) && (runtime.GOOS == "windows" || filepath.Clean(d) == at) {
+			return false
+		}
+	}
+	return true
+}
+
 // cliBin is where the agent's CLI is, "" when it has none magpie knows or
 // it isn't on PATH.
 func (a *Agent) cliBin() (string, cliSpec) {
 	spec, ok := cliSpecs[a.ID]
-	if !ok || a.WSL != "" || a.Bin == "" {
+	if !ok || a.WSL != "" {
 		return "", spec
 	}
-	bin, err := exec.LookPath(a.Bin)
-	if err != nil {
+	if a.Bin == "" {
+		home, err := os.UserHomeDir()
+		if spec.at == "" || err != nil {
+			return "", spec
+		}
+		if bin := filepath.Join(home, filepath.FromSlash(exe(spec.at))); isFile(bin) {
+			return bin, spec
+		}
+		return "", spec
+	}
+	bin := binAt(a.Bin)
+	if bin == "" {
 		return "", spec
 	}
 	if abs, err := filepath.Abs(bin); err == nil {
@@ -500,18 +652,22 @@ func (a *Agent) cliBin() (string, cliSpec) {
 }
 
 // CLI is the agent's CLI: its version, the newest, and whether magpie can
-// update it. ok is false for an agent without a CLI magpie knows.
+// update it, with its desktop app's version. ok is false for an agent with
+// neither a CLI magpie knows nor its app.
 func (a *Agent) CLI() (c CLI, ok bool) {
+	c.App = a.AppVersion()
 	bin, spec := a.cliBin()
 	if bin == "" {
-		return CLI{}, false
+		return c, c.App != ""
 	}
-	c.Version = installedVersion(bin)
-	u := howInstalled(spec, bin)
+	real, u := installedAt(spec, bin)
+	c.Version = installedVersion(real)
+	c.Path = bin
+	c.OffPath = a.Bin != "" && offPath(bin, loginPath())
 	if u == nil {
 		return c, true
 	}
-	c.Via, c.Command = u.via, u.shown()
+	c.Via, c.Command, c.Admin = u.via, u.shown(), u.admin
 	c.Latest = latestVersion(u)
 	c.Update = c.Version != "" && c.Latest != "" && Newer(c.Latest, c.Version)
 	return c, true
@@ -525,7 +681,8 @@ func (a *Agent) InstalledVersion() string {
 	if bin == "" {
 		return ""
 	}
-	return installedVersion(bin)
+	real, _ := throughShim(bin)
+	return installedVersion(real)
 }
 
 // CLIs is every detected agent's CLI, as far as it is known within wait;
@@ -566,13 +723,69 @@ func CLIs(wait time.Duration) (out map[string]CLI, pending bool) {
 
 var updating sync.Map // agent id → an update running
 
+// canWrite is writable, and adminNPM whether an npm whose global folder
+// this user can't write in is updated as administrator (on Windows, after
+// its prompt) rather than not offered; vars so tests can stand in for
+// them.
+var (
+	canWrite = writable
+	adminNPM = update.CanRunElevated()
+)
+
+// runAdmin runs an update as administrator; a var so tests never ask for
+// one.
+var runAdmin = func(ctx context.Context, u *updater) ([]byte, error) {
+	home, _ := os.UserHomeDir()
+	return update.RunElevated(ctx, home, updateEnv(u), u.cmd...)
+}
+
+// AdminError is an install or update that needs an administrator and
+// didn't get one: the prompt declined (Canceled), or none to be had (Err).
+// The command never ran. Agent is what it installs (an agent, or RTK);
+// Prefix the folder only an administrator can change, "" when not known;
+// Via the tool, npm or winget, whose fix is said.
+type AdminError struct {
+	Agent, Prefix, Command, Via string
+	Canceled                    bool
+	Err                         error
+}
+
+func (e *AdminError) Error() string {
+	why := "Windows' administrator prompt was declined"
+	if !e.Canceled {
+		why = "magpie couldn't ask Windows for one (" + e.Err.Error() + ")"
+	}
+	where := fmt.Sprintf("%s is installed in %s, which only an administrator can change", e.Agent, e.Prefix)
+	if e.Prefix == "" {
+		where = e.Agent + " needs an administrator here"
+	}
+	if e.Via == "winget" {
+		return fmt.Sprintf("%s, and %s. Try again and allow it, or run %s in a terminal opened as administrator.", where, why, e.Command)
+	}
+	return fmt.Sprintf(`%s, and %s. Update again and allow it, run %s in a terminal opened as administrator, or move npm's global folder to one of your own (npm config set prefix "%%APPDATA%%\npm") and install %s again.`,
+		where, why, e.Command, e.Agent)
+}
+
+func (e *AdminError) Unwrap() error { return e.Err }
+
 // runUpdate runs an update with nothing to answer it; a var so tests never
 // run a real one.
 var runUpdate = func(ctx context.Context, u *updater) ([]byte, error) {
 	cmd := proc.CommandContext(ctx, u.cmd[0], u.cmd[1:]...)
 	cmd.Stdin = nil
 	cmd.Dir, _ = os.UserHomeDir()
+	cmd.Env = updateEnv(u)
+	return cmd.CombinedOutput()
+}
+
+// updateEnv is the environment an update runs in: the proxy magpie's own
+// requests take (a SOCKS5 one bridged for bun, which can't use it: #1409),
+// and u's PATH first.
+func updateEnv(u *updater) []string {
 	env := netproxy.Env(os.Environ())
+	if u.via == "bun" {
+		env = netproxy.EnvForBun(env)
+	}
 	if u.path != "" {
 		for i, kv := range env {
 			if k, v, _ := strings.Cut(kv, "="); strings.EqualFold(k, "PATH") {
@@ -580,8 +793,7 @@ var runUpdate = func(ctx context.Context, u *updater) ([]byte, error) {
 			}
 		}
 	}
-	cmd.Env = append(env, "NONINTERACTIVE=1", "HOMEBREW_NO_ENV_HINTS=1", "NO_COLOR=1")
-	return cmd.CombinedOutput()
+	return append(env, "NONINTERACTIVE=1", "HOMEBREW_NO_ENV_HINTS=1", "NO_COLOR=1")
 }
 
 // updateTimeout bounds an update: a download, or Homebrew updating itself first.
@@ -594,7 +806,7 @@ func (a *Agent) UpdateCLI() (CLI, error) {
 	if bin == "" {
 		return CLI{}, fmt.Errorf("magpie can't find %s's CLI", a.Name)
 	}
-	u := howInstalled(spec, bin)
+	real, u := installedAt(spec, bin)
 	if u == nil {
 		return CLI{}, fmt.Errorf("magpie can't tell how %s was installed at %s — update it the way you installed it", a.Name, bin)
 	}
@@ -602,11 +814,24 @@ func (a *Agent) UpdateCLI() (CLI, error) {
 		return CLI{}, fmt.Errorf("%s is already being updated", a.Name)
 	}
 	defer updating.Delete(a.ID)
-	before := installedVersion(bin)
+	before := installedVersion(real)
 	ctx, cancel := context.WithTimeout(context.Background(), updateTimeout)
 	defer cancel()
-	out, err := runUpdate(ctx, u)
-	versions.forget(bin)
+	run := runUpdate
+	if u.admin {
+		run = runAdmin
+	}
+	out, err := run(ctx, u)
+	if u.admin && (errors.Is(err, update.ErrCanceled) || errors.Is(err, update.ErrNoAdmin)) {
+		// the prompt declined, or none shown: npm never ran
+		return CLI{}, &AdminError{Agent: a.Name, Prefix: u.prefix, Command: u.shown(), Via: "npm", Canceled: errors.Is(err, update.ErrCanceled), Err: err}
+	}
+	if err == nil && u.reshim != nil {
+		// what it installed is kept even when no shim is made for it
+		runUpdate(ctx, &updater{via: "reshim", cmd: u.reshim})
+	}
+	versions.forget(real)
+	shimTargets.forget(bin)
 	// brew upgrade updates Homebrew first, which may know a newer one
 	latests.forget("brew:" + u.pkg)
 	c, _ := a.CLI()

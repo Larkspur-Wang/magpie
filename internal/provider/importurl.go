@@ -1,9 +1,11 @@
 package provider
 
 import (
+	"cmp"
 	"errors"
 	"net"
 	"net/url"
+	"slices"
 	"strings"
 )
 
@@ -14,7 +16,8 @@ import (
 //
 // Parameters (every value URL-encoded):
 //
-//	preset     a preset id (magpie presets); the preset's endpoints are used
+//	preset     a preset id (magpie presets); the preset's endpoints are used.
+//	           Not google-vertex, asked at the user's own Google Cloud project
 //	region     with a preset that has regions, which one
 //	name       the provider's name; required without a preset
 //	id         its id; derived from the name when absent
@@ -55,9 +58,15 @@ func ParseImport(link string) (Provider, error) {
 		if p, err = FromPreset(strings.ToLower(id)); err != nil {
 			return Provider{}, err
 		}
+		if p.IsVertex() {
+			// asked at the user's own Google Cloud project, with their
+			// own credentials: nothing a link could hand over
+			return Provider{}, errorf("%s is added with your own Google Cloud project, not from a link: magpie provider add %s project=<id>, or Add in the app", p.Name, VertexPreset)
+		}
 		if r := get("region"); r != "" {
 			found := false
-			for _, reg := range Preset(p.Preset).Regions {
+			pr := Preset(p.Preset)
+			for _, reg := range pr.Regions {
 				if reg.ID == r {
 					p.Chat, p.Responses, p.Anthropic, found = reg.Chat, reg.Responses, reg.Anthropic, true
 					// a region with a key page of its own (Qianfan's pay
@@ -65,6 +74,11 @@ func ParseImport(link string) (Provider, error) {
 					// provider is saved
 					if reg.KeysURL != "" {
 						p.KeysURL = reg.KeysURL
+					}
+					// and its docs and prices (Tencent Cloud's TokenHub)
+					p.Website = cmp.Or(reg.Website, pr.Website)
+					if slices.ContainsFunc(pr.Regions, func(x Region) bool { return x.Catalog != "" }) {
+						p.Catalog = cmp.Or(reg.Catalog, pr.Catalog)
 					}
 				}
 			}
@@ -115,6 +129,13 @@ func ParseImport(link string) (Provider, error) {
 	}
 	if p.ID == "magpie" {
 		return Provider{}, errors.New(`"magpie" is what agents call the gateway itself; the link needs another id`)
+	}
+	if subscriptionID(p.ID) {
+		// named as a subscription is (claude, kiro): a provider of its own
+		// beside it, never in its place, where the subscription's sign-in
+		// would be lost, or Kiro's take the link's key to its own host
+		// (#1487)
+		p.ID = freeID(p.ID)
 	}
 	if len(p.Name) > 80 {
 		p.Name = p.Name[:80]

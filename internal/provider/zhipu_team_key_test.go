@@ -42,10 +42,8 @@ func TestZhipuKeyTeamFields(t *testing.T) {
 				w.Write([]byte(`{"code":500,"msg":"no plan","success":false}`))
 				return
 			}
-			mu.Lock()
 			hosts[key] = append(hosts[key], r.Header.Get("X-Host"))
 			asked[key] = r.Header.Clone()
-			mu.Unlock()
 			if r.Header.Get("Bigmodel-Organization") != "org-1" || r.Header.Get("Bigmodel-Project") != "proj-1" {
 				w.Write([]byte(`{"code":1001,"msg":"no team","success":false}`))
 				return

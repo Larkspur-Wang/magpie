@@ -42,6 +42,8 @@ Only after both direct model probes pass, prepend:
 - `mirasim-gpt/gpt-6.1-sol` to `group/gpt-sol`.
 
 Keep the existing group IDs, ordered policy, and subsequent members intact.
+Use `stays=turn` for the two GPT groups: retry the highest-priority source
+on each new user turn, while keeping tool continuations on their serving source.
 Confirm the successful `tries[].id` is `mirasim-gpt`, not a fallback provider.
 Mirasim UI profiles can keep referencing the same groups; do not rename or
 recreate them. No agent default needs changing.
@@ -60,6 +62,7 @@ node scripts/verify-mirasim-gpt.mjs group/gpt-6-astra group/gpt-sol
 ```
 
 Offline tests cover separate configuration/auth identities, GPT-only catalog,
+the account's verified catalog during an offline cold start,
 renewal, signed Responses including tools, injected-header removal, absent
 credentials, failed login and model-scoped quota. The live script verifies
 text, an unpredictable function-tool roundtrip and Responses SSE per model.

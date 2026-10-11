@@ -8,7 +8,7 @@ function gptModels(models = {}) {
 }
 
 // Keep this plugin's login and models separate from the native Claude bridge.
-export async function adapt(input, factory) {
+export async function adapt(input, factory, accountModels = () => ({})) {
   const client = Object.create(input.client)
   client.auth = Object.create(input.client.auth)
   client.auth.set = (value) => input.client.auth.set({
@@ -80,7 +80,11 @@ export async function adapt(input, factory) {
     provider: {
       id: ID,
       async models(provider, context) {
-        return gptModels(await native.provider.models(provider, context))
+        const seeded = {
+          ...provider,
+          models: { ...accountModels(context?.auth), ...provider.models },
+        }
+        return gptModels(await native.provider.models(seeded, context))
       },
     },
   }

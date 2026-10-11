@@ -224,7 +224,14 @@ func pluginProvider(pp plugin.Provider, l pluginLogin) Provider {
 			p.Name = n
 		}
 	}
-	for _, m := range pp.Models {
+	models := pp.Models
+	// A cold or temporarily offline catalog still has the plugin's declared
+	// transport. Its loader authenticates requests; an empty list must not
+	// turn a configured Responses provider into "no endpoint configured".
+	if len(models) == 0 && pp.NPM != "" {
+		models = []plugin.Model{{NPM: pp.NPM}}
+	}
+	for _, m := range models {
 		switch pluginProtocol(pp.ID, m) {
 		case Chat:
 			p.Chat = pluginBase + pp.ID + "/v1"

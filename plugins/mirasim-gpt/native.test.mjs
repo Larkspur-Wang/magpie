@@ -60,3 +60,20 @@ test("unsigned account cannot generate or fabricate a model catalog", async (t) 
   const usage = await hooks.auth.usage(async () => null)
   assert(usage.error.includes("not signed in"))
 })
+
+test("cold start retains the account's verified GPT catalog during a network failure", async (t) => {
+  const original = globalThis.fetch
+  t.after(() => { globalThis.fetch = original })
+  globalThis.fetch = async () => { throw new Error("offline during startup") }
+  const auth = {
+    type: "oauth", access: "FAKE_VALID", expires: Date.now() + 7200000,
+    deviceKey: _internal.newDeviceKey(),
+    models: JSON.stringify({ data: [{ id: "gpt-6-astra", max_input_tokens: 872000 }, { id: "claude-opus-5-5" }] }),
+  }
+  const hooks = await adapter({ client: { auth: { set() { throw new Error("unexpected write") } } } })
+  const models = await hooks.provider.models({ models: {} }, { auth })
+  assert.deepEqual(Object.keys(models), ["gpt-6-astra"])
+  assert.equal(models["gpt-6-astra"].api.npm, "@ai-sdk/openai")
+  assert.equal(models["gpt-6-astra"].limit.context, 872000)
+  assert.equal((await hooks.provider.models({ models: {} }, { auth: null }))["gpt-6-astra"], undefined)
+})

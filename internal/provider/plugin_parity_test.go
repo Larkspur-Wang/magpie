@@ -78,6 +78,27 @@ func TestPluginCatalogPriceAndImages(t *testing.T) {
 	}
 }
 
+func TestPluginColdStartKeepsDeclaredEndpoint(t *testing.T) {
+	claudeHome(t)
+	for _, tc := range []struct {
+		npm  string
+		want Protocol
+	}{
+		{"@ai-sdk/openai", Responses},
+		{"@ai-sdk/anthropic", Anthropic},
+		{"@ai-sdk/openai-compatible", Chat},
+	} {
+		p := pluginProvider(plugin.Provider{ID: "cold-plugin", NPM: tc.npm}, pluginLogin{})
+		if !slices.Contains(p.Speaks(), tc.want) {
+			t.Errorf("cold %s has no %s endpoint: %v", tc.npm, tc.want, p.Speaks())
+		}
+	}
+	p := pluginProvider(plugin.Provider{ID: "unknown-plugin"}, pluginLogin{})
+	if len(p.Speaks()) != 0 {
+		t.Errorf("plugin with no declared transport acquired endpoints: %v", p.Speaks())
+	}
+}
+
 // A built-in moved onto its plugin stands where the built-in stood among
 // the accounts; a plugin's own provider goes last.
 func TestMovedAccountKeepsItsPlace(t *testing.T) {

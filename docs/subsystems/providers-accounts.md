@@ -9,6 +9,13 @@ The gateway can send a request to three kinds of upstream:
 Package `internal/provider` holds all three, the routing groups built over
 them, and what is left of each one's allowance.
 
+The native Mirasim catalog (`RefreshMirasim`, `internal/provider/mirasim.go`)
+keeps platform model IDs and their context and effort metadata. It excludes
+`profile:` entries: those are the desktop's external-provider routes, not
+models served by Mirasim, and can point back to this gateway. Refreshing the
+native catalog replaces withdrawn platform IDs rather than aliasing them to
+other models.
+
 Plugin ownership of the deprecated built-in subscriptions is in
 [Provider and plugin ownership](provider-plugins.md). How the gateway orders
 keys and accounts per request is in [Gateway routing and fallback](gateway-routing.md).

@@ -18,7 +18,7 @@ func TestMirasimCatalogUsesNativeIdsAndAvailableEfforts(t *testing.T) {
 	path := filepath.Join(h, "mirasim")
 	script := `#!/bin/sh
 echo 'host starting'
-echo '{"agent":"claude","models":[{"id":"claude-opus-5-5[1m]","label":"Opus","contextWindow":1000000},{"id":"glm-5.3-flash"}],"effortByModel":{"claude-opus-5-5[1m]":[{"id":"low"},{"id":"medium","unavailable":true},{"id":"ultra"}]}}'
+echo '{"agent":"claude","models":[{"id":"claude-opus-5-5[1m]","label":"Opus","contextWindow":1000000},{"id":"glm-5.3-flash"},{"id":"profile:1d8fc033-1674-4a63-bf35-d362bfa18c40","label":"Magpie GPT group"}],"effortByModel":{"claude-opus-5-5[1m]":[{"id":"low"},{"id":"medium","unavailable":true},{"id":"ultra"}]}}'
 `
 	if err := os.WriteFile(path, []byte(script), 0700); err != nil {
 		t.Fatal(err)

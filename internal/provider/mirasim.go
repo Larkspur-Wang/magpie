@@ -33,6 +33,10 @@ func RefreshMirasim(ctx context.Context) ([]catalog.Model, error) {
 	seen := map[string]bool{}
 	for _, m := range c.Models {
 		id := strings.TrimSuffix(m.ID, "[1m]")
+		// Profiles are external routes, potentially back to this gateway.
+		if strings.HasPrefix(id, "profile:") {
+			continue
+		}
 		if seen[id] {
 			continue
 		}

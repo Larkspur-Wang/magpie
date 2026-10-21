@@ -37,6 +37,10 @@ Optional `plugins.json` options on the entry:
 - `space`: the Cohub Space completions run in (or set `COHUB_SPACE_ID`);
   default is the account's home Space.
 
+The home Space is resolved through the CLI's current `resolveHomeSpace`
+export, or `resolveDefaultSpace` on older CLI versions. An explicit Space
+still takes precedence; no agent's default Space or sign-in is changed.
+
 ## Usage and quota
 
 Magpie records each request's tokens, served model and latency like any

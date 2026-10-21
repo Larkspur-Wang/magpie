@@ -16,7 +16,7 @@ const MODELS = {
 
 // fakeCLI writes a cohub-cli package whose client answers from the given
 // script; calls records what the plugin sent.
-async function fakeCLI(t, { events, result, error, me = { email: "lark@example.com" } } = {}) {
+async function fakeCLI(t, { events, result, error, me = { email: "lark@example.com" }, spaceResolver = "resolveDefaultSpace" } = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "magpie-cohub-test-"))
   t.after(() => fs.rm(root, { recursive: true, force: true }))
   await fs.mkdir(path.join(root, "dist"), { recursive: true })
@@ -42,7 +42,7 @@ async function fakeCLI(t, { events, result, error, me = { email: "lark@example.c
         },
       }
     }`)
-  await fs.writeFile(path.join(root, "dist", "space.js"), "export const resolveDefaultSpace = async () => 'home-space'")
+  await fs.writeFile(path.join(root, "dist", "space.js"), `export const ${spaceResolver} = async () => 'home-space'`)
   globalThis.__cohubCalls = []
   return root
 }
@@ -158,6 +158,15 @@ test("a plain request goes to the home Space and answers a chat completion", asy
   assert.equal(out.choices[0].message.content, "OK")
   assert.equal(out.model, "glm-5.3-flash:text")
   assert.deepEqual(globalThis.__cohubCalls, [{ id: "home-space", stream: false, input: { model: "glm-5.3-flash", messages: [{ role: "user", content: [{ type: "text", text: "say OK" }] }] } }])
+})
+
+test("the current CLI's resolveHomeSpace export is supported", async (t) => {
+  const root = await fakeCLI(t, { spaceResolver: "resolveHomeSpace", result: { completionId: "r2", message: { content: [{ type: "text", text: "OK" }], stopReason: "stop" }, usage: { input: 5, output: 1 } } })
+  const hooks = await cohub({}, { root })
+  const res = await request(hooks, { model: "glm-5.3-flash:text", messages: [{ role: "user", content: "say OK" }] })
+  assert.equal(res.status, 200)
+  assert.equal((await res.json()).choices[0].message.content, "OK")
+  assert.equal(globalThis.__cohubCalls[0].id, "home-space")
 })
 
 test("a streamed request answers SSE; a configured Space is used", async (t) => {

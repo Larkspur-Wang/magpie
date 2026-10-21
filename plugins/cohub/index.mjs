@@ -147,7 +147,8 @@ export default async function cohub(input, options = {}) {
   const space = async () => {
     if (spaceId) return spaceId
     const { space: s } = await load()
-    spaceId = options.space || process.env.COHUB_SPACE_ID?.trim() || (await s.resolveDefaultSpace())
+    const resolveHome = s.resolveHomeSpace || s.resolveDefaultSpace
+    spaceId = options.space || process.env.COHUB_SPACE_ID?.trim() || (await resolveHome())
     if (!spaceId) throw new RequestError(409, "Cohub has no home Space for this account: set the plugin's space option", "upstream_error")
     return spaceId
   }

@@ -21,11 +21,25 @@ import (
 )
 
 // EditedError is an update refused because the skill was changed here
-// since it was fetched from GitHub.
-type EditedError struct{ Name string }
+// since it was fetched from GitHub, or From, the git repository it came
+// from.
+type EditedError struct{ Name, From string }
 
 func (e *EditedError) Error() string {
-	return fmt.Sprintf("%s was changed here since it was fetched from GitHub; updating it would replace those changes", e.Name)
+	from := e.From
+	if from == "" {
+		from = "GitHub"
+	}
+	return fmt.Sprintf("%s was changed here since it was fetched from %s; updating it would replace those changes", e.Name, from)
+}
+
+// editedError is the refusal of an update of s, naming where it came from.
+func editedError(s *Skill) *EditedError {
+	e := &EditedError{Name: s.Name}
+	if s.Source != nil && s.Source.Kind == "git" {
+		e.From = s.Source.Repo
+	}
+	return e
 }
 
 // edits remembers, for each skill's library folder, its hash as of when
@@ -45,7 +59,11 @@ type editMemo struct {
 // aside what Finder keeps in it: "" when it can't be read.
 func libraryHash(name string) string {
 	dir := skillDir(name)
-	at := changedAt(dir)
+	// a folder not wholly read has no time to remember its hash by
+	at, err := changedAt(dir)
+	if err != nil {
+		at = time.Time{}
+	}
 	edits.Lock()
 	m, ok := edits.m[dir]
 	edits.Unlock()
@@ -68,7 +86,7 @@ func libraryHash(name string) string {
 // hash of what it fetched (installed before it did), or the folder can't
 // be read.
 func (l *Library) editState(s *Skill, targets []*Target) (edited, known bool) {
-	if s.Source == nil || s.Source.Kind != "github" || s.Hash == "" {
+	if !s.Source.remote() || s.Hash == "" {
 		return false, false
 	}
 	lib := skillDir(s.Name)
@@ -92,7 +110,16 @@ func (l *Library) editState(s *Skill, targets []*Target) (edited, known bool) {
 			continue
 		}
 		made, ok := copiedAt(p)
-		if !ok || !changedAt(p).After(made) {
+		if !ok {
+			continue
+		}
+		// a copy not wholly read can't be told unchanged; the sync keeps
+		// it in place, and an update keeps the library's version aside
+		at, err := changedAt(p)
+		if err != nil {
+			return false, false
+		}
+		if !at.After(made) {
 			continue
 		}
 		if !sameTree(p, lib) {

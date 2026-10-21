@@ -31,7 +31,6 @@ package agent
 import (
 	"encoding/json"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -40,6 +39,7 @@ import (
 	"github.com/tidwall/gjson"
 	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/edit"
+	"github.com/yetone/magpie/internal/proc"
 )
 
 // vscodeDefault is chat.defaultModel, a key with a dot in it, escaped for
@@ -122,6 +122,15 @@ func vscodeInsidersAgent(home, cfg string) *Agent { return vscodeOf(vscodeInside
 func vscodium(home, cfg string) *Agent { return vscodeOf(vscodiumKind, home, cfg) }
 
 func vscodeOf(k vscodeKind, home, cfg string) *Agent {
+	if k.exts != "" {
+		k.extDir = filepath.Join(home, k.exts, "extensions")
+	}
+	return vscodeKindAt(k, vscodeUserDir(k, home, cfg))
+}
+
+// vscodeUserDir is the User folder of the VS Code k, where its settings.json
+// is: its extensions' (Zoo Code's) settings too.
+func vscodeUserDir(k vscodeKind, home, cfg string) string {
 	switch runtime.GOOS {
 	case "darwin":
 		cfg = filepath.Join(home, "Library", "Application Support")
@@ -131,10 +140,7 @@ func vscodeOf(k vscodeKind, home, cfg string) *Agent {
 			cfg = filepath.Join(home, "AppData", "Roaming")
 		}
 	}
-	if k.exts != "" {
-		k.extDir = filepath.Join(home, k.exts, "extensions")
-	}
-	return vscodeKindAt(k, filepath.Join(cfg, k.folder, "User"))
+	return filepath.Join(cfg, k.folder, "User")
 }
 
 func vscodeAt(dir string) *Agent { return vscodeKindAt(vscodeStable, dir) }
@@ -215,7 +221,7 @@ func vscodeKindAt(k vscodeKind, dir string) *Agent {
 			if isDir(dir) {
 				return true
 			}
-			bin, err := exec.LookPath(k.bin)
+			bin, err := proc.Look(k.bin)
 			return err == nil && vscodeCodeBinary(bin)
 		},
 		Notice: func() string {
@@ -421,7 +427,7 @@ func vscodeGroupJSON(k vscodeKind, vendor string) map[string]any {
 		if output <= 0 {
 			output = 8192
 		}
-		output = min(output, context/4)
+		output = outputOr(m, min(output, context/4))
 		entry := map[string]any{
 			"id": m.ID, "name": m.Name, "url": vscodeURL(),
 			"toolCalling": true, "vision": m.Images,

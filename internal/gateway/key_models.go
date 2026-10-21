@@ -16,9 +16,10 @@ import (
 // is refused before any provider is asked. A model is held to by its
 // provider's id and its own, "<provider>/<model>", whatever the agent
 // called it. A routing group passes when the key names it, "group/<id>"
-// (or "group/*", every group), and then every member of it does, through
-// it; else only when every model in it does. A group the key names inside
-// one it doesn't counts for its own members.
+// (or "group/*", every group), a group magpie found by its auto/<model>
+// too, either id passing for the other (allows), and then every member of
+// it does, through it; else only when every model in it does. A group the
+// key names inside one it doesn't counts for its own members.
 
 // magpieChoseKey marks, in a request's context, a call magpie makes for a
 // model the user picked in its settings rather than the caller (a web
@@ -52,20 +53,46 @@ func accountHolds(r *http.Request) (access.Identity, bool) {
 	return who, len(who.Accounts) > 0
 }
 
+// allows is who.Allows, a found group named by either of its ids: a key
+// held to auto/<model> (as the model lists give it, any spelling of the
+// model) may use group/auto-<slug>, the id the gateway routes it by, and
+// one held to group/auto-<slug> or group/* the auto/<model> an agent asks
+// for, which the gateway takes back to that id (validateModel). A pattern
+// of auto/ ids ("auto/*") holds to the groups' auto/<model>.
+func allows(who access.Identity, ids ...string) bool {
+	if who.Allows(ids...) {
+		return true
+	}
+	for _, id := range ids {
+		if !strings.HasPrefix(id, provider.GroupPrefix+"auto-") {
+			continue
+		}
+		if pub := provider.PublicRef(id); pub != id && who.Allows(pub) {
+			return true
+		}
+		for _, p := range who.Models {
+			if !strings.Contains(p, "*") && strings.HasPrefix(p, provider.AutoPrefix) && strings.EqualFold(provider.CanonicalRef(p), id) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // modelAllowed says the key may use provider p's model.
 func modelAllowed(who access.Identity, p provider.Provider, model string) bool {
-	return who.Allows(p.ID + "/" + model)
+	return allows(who, p.ID+"/"+model)
 }
 
 // memberAllowed says the key may use a routing group's member: the model,
 // or a group it is reached through that the key names.
 func memberAllowed(who access.Identity, m provider.Member) bool {
-	return who.Allows(append([]string{m.Provider.ID + "/" + m.Model}, m.Path...)...)
+	return allows(who, append([]string{m.Provider.ID + "/" + m.Model}, m.Path...)...)
 }
 
 // groupNamed says the key names the routing group g itself.
 func groupNamed(who access.Identity, g provider.Group) bool {
-	return g.ID != "" && who.Allows(provider.GroupPrefix+g.ID)
+	return g.ID != "" && (allows(who, provider.GroupPrefix+g.ID) || who.Allows(g.Ref()))
 }
 
 // groupAllowed says the key may use the routing group g: it names it, or
@@ -101,20 +128,38 @@ func membersAllowed(who access.Identity, ms []provider.Member) bool {
 	return true
 }
 
+// keyList weighs a model list's entries for one request's key (#1762):
+// the routing groups are read once for the list, not once an entry —
+// each read is every provider's models, its files stat'ed again, and a
+// list of 1,000 models with 500 groups took seconds — and each
+// provider's accounts and keys once, not once a model. Nothing is kept
+// past the request, so the next sees a group, account or key's models
+// changed, as before.
+type keyList struct {
+	who  access.Identity
+	find func(string) (provider.Group, []provider.Member, bool)
+	refs map[string][]provider.AccountRef
+}
+
+func newKeyList(who access.Identity) *keyList {
+	return &keyList{who: who, find: provider.GroupFinder(), refs: map[string][]provider.AccountRef{}}
+}
+
 // entryAllowed says the key is shown a model of the catalog — and some
 // account or key it may use serves it (#905): one the provider's
 // accounts are set not to serve (#474) is none of the key's.
-func entryAllowed(who access.Identity, e provider.Entry) bool {
+func (k *keyList) entryAllowed(e provider.Entry) bool {
+	who := k.who
 	if !who.Restricted() {
 		return true
 	}
 	if e.Group != "" {
-		g, ms, ok := provider.FindGroup(e.ID)
+		g, ms, ok := k.find(e.ID)
 		if !ok || !groupAllowed(who, g, ms) {
 			return false
 		}
 		for _, m := range ms {
-			if accountServes(who, m.Provider, m.Model) {
+			if k.accountServes(m.Provider, m.Model) {
 				return true
 			}
 		}
@@ -123,7 +168,21 @@ func entryAllowed(who access.Identity, e provider.Entry) bool {
 	if !modelAllowed(who, e.Provider, e.Model) {
 		return false
 	}
-	return accountServes(who, e.Provider, e.Model)
+	return k.accountServes(e.Provider, e.Model)
+}
+
+// accountServes is accountServes with p's accounts and keys read once
+// for the list.
+func (k *keyList) accountServes(p provider.Provider, model string) bool {
+	if len(k.who.Accounts) == 0 {
+		return true
+	}
+	refs, ok := k.refs[p.ID]
+	if !ok {
+		refs = p.AccountIDs()
+		k.refs[p.ID] = refs
+	}
+	return accountServesOn(k.who, p, model, refs)
 }
 
 // accountServes says some account or key the key may use serves the provider's
@@ -133,7 +192,11 @@ func accountServes(who access.Identity, p provider.Provider, model string) bool 
 	if len(who.Accounts) == 0 {
 		return true
 	}
-	refs := p.AccountIDs()
+	return accountServesOn(who, p, model, p.AccountIDs())
+}
+
+// accountServesOn is accountServes over refs, p's accounts and keys.
+func accountServesOn(who access.Identity, p provider.Provider, model string, refs []provider.AccountRef) bool {
 	if len(refs) == 0 {
 		// a provider with no account and no key (a local ollama): the
 		// list holds a key to some accounts of the providers it names
@@ -163,9 +226,10 @@ func keyAllowed(r *http.Request, es []provider.Entry) []provider.Entry {
 	if !held {
 		return es
 	}
+	k := newKeyList(who)
 	out := make([]provider.Entry, 0, len(es))
 	for _, e := range es {
-		if entryAllowed(who, e) {
+		if k.entryAllowed(e) {
 			out = append(out, e)
 		}
 	}
@@ -203,10 +267,13 @@ func allowedCandidates(who access.Identity, cs []candidate, pl planned, members 
 		}
 	}
 	pl.order = order
-	// nor is one held for its credits there for a reset to bring back
-	pl.held = slices.DeleteFunc(slices.Clone(pl.held), func(c candidate) bool {
+	// nor is one held for its credits there for a reset to bring back, or
+	// one past its cap for a conversation kept strictly on it
+	gone := func(c candidate) bool {
 		return !members[c.p.ID+"/"+c.model] && !modelAllowed(who, c.p, c.model) || !accountAllowed(who, c)
-	})
+	}
+	pl.held = slices.DeleteFunc(slices.Clone(pl.held), gone)
+	pl.capped = slices.DeleteFunc(slices.Clone(pl.capped), gone)
 	return out, pl, held && len(out) == 0
 }
 

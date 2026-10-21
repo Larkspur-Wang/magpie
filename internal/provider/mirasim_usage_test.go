@@ -96,3 +96,27 @@ func TestMirasimNativeQuotaFeedsUsageAndRouting(t *testing.T) {
 		t.Fatal("stale Mirasim card visible after disabling")
 	}
 }
+
+// The platform's max plan reports one rolling 30-day window for every model
+// rather than the 5-hour and weekly pair, and it still constrains them all.
+func TestMirasimQuotaReadsTheSingle30DayWindow(t *testing.T) {
+	now := time.Now()
+	raw := `{"mode":"cloud","configured":true,"login":{"plan":"max","planExp":1792674899},"usage":{"ok":true,"source":"relay-limits","windows":[{"label":"30d","usedPercent":90.5,"resetAfterSeconds":1610575}]}}`
+	s, err := mirasim.ParseRelayStatus([]byte(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Usage.CapturedAt = now.Format(time.RFC3339Nano)
+	q := mirasimQuota(s, now)
+	if q.Error != "" || len(q.Windows) != 1 {
+		t.Fatalf("%+v", q)
+	}
+	w := q.Windows[0]
+	if w.Name != "30 days" || w.Span != 30*24*time.Hour || w.Used != 90.5 || w.Aside {
+		t.Fatalf("30d window read as %+v", w)
+	}
+	a := allowanceOf(q.Windows, now)
+	if used, _ := a.For("claude-opus-5-5", now); used != 90.5 {
+		t.Fatalf("the 30-day window did not constrain the model: %v", used)
+	}
+}

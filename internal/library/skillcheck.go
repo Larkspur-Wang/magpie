@@ -19,6 +19,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/yetone/magpie/internal/ghtoken"
 	"github.com/yetone/magpie/internal/source"
 )
 
@@ -53,10 +54,10 @@ type Limited struct {
 	Token bool   `json:"token,omitempty"`
 }
 
-func (e errLimited) view() *Limited {
-	l := &Limited{Token: e.token}
-	if !e.until.IsZero() {
-		l.Until = e.until.UTC().Format(time.RFC3339)
+func limitedView(e errLimited) *Limited {
+	l := &Limited{Token: e.Token}
+	if !e.Until.IsZero() {
+		l.Until = e.Until.UTC().Format(time.RFC3339)
 	}
 	return l
 }
@@ -96,7 +97,7 @@ const checkEvery = 12 * time.Hour
 // GitHub for updates: none checked since magpie started, or not for
 // checkEvery.
 func checkDue(l *Library) bool {
-	if !slices.ContainsFunc(l.Skills, func(s *Skill) bool { return s.Source != nil && s.Source.Kind == "github" }) {
+	if !slices.ContainsFunc(l.Skills, func(s *Skill) bool { return s.Source.remote() }) {
 		return false
 	}
 	at := checkedAt.Load()
@@ -133,12 +134,7 @@ func lastCommit(src Source) (*commit, error) {
 	}
 	switch {
 	case code == 401 && token:
-		_, from := GitHubToken()
-		where := "the GitHub token in Settings → Network and sharing"
-		if from != "settings" {
-			where = from + " (no GitHub token is set in Settings → Network and sharing)"
-		}
-		return nil, fmt.Errorf("GitHub refused %s: it may have expired or been revoked", where)
+		return nil, ghtoken.Refused()
 	case code == 404, code == 422:
 		if src.Ref != "" {
 			return nil, fmt.Errorf("GitHub has no %s at %s any more", src.Repo, src.Ref)
@@ -166,7 +162,6 @@ func apiGet(u string) ([]byte, int, bool, error) {
 	req, _ := http.NewRequest("GET", u, nil)
 	req.Header.Set("User-Agent", "magpie")
 	req.Header.Set("Accept", "application/vnd.github+json")
-	token := withGitHubToken(req)
 	etags.Lock()
 	had, cached := etags.m[u]
 	etags.Unlock()
@@ -174,7 +169,7 @@ func apiGet(u string) ([]byte, int, bool, error) {
 		req.Header.Set("If-None-Match", had.etag)
 	}
 	c := &http.Client{Timeout: 20 * time.Second}
-	resp, err := source.Do(c, req)
+	resp, token, err := doGitHub(req, func(r *http.Request) (*http.Response, error) { return source.Do(c, r) })
 	if err != nil {
 		return nil, 0, token, fmt.Errorf("couldn't reach GitHub: %w", err)
 	}
@@ -279,7 +274,8 @@ func firstLine(s string) string {
 // that isn't known yet, by fetching the repository once and comparing the
 // folder's files with the skill's. A skill GitHub couldn't be asked about
 // is unknown, and the others are checked all the same; once GitHub limits
-// requests, the rest aren't asked about.
+// requests, the rest aren't asked about. A skill from another git
+// repository is checked with the user's git (checkGitSkill).
 func CheckSkills() ([]SkillCheck, error) {
 	mu.Lock()
 	l, err := load()
@@ -289,8 +285,8 @@ func CheckSkills() ([]SkillCheck, error) {
 	}
 	byRepo := map[string][]*Skill{}
 	for _, s := range l.Skills {
-		if s.Source != nil && s.Source.Kind == "github" {
-			byRepo[s.Source.Repo] = append(byRepo[s.Source.Repo], s)
+		if s.Source.remote() {
+			byRepo[s.Source.Kind+"\x00"+s.Source.Repo] = append(byRepo[s.Source.Kind+"\x00"+s.Source.Repo], s)
 		}
 	}
 	f := &fetcher{}
@@ -310,9 +306,16 @@ func CheckSkills() ([]SkillCheck, error) {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			asked := map[string]*commit{} // a repository's skills in one folder are asked about once
+			heads := map[string]string{}  // a git repository's refs, asked about once
 			refs := []string{}
 			for _, s := range skills {
-				c, sha, hash := checkSkill(s, f, asked, &limited)
+				var c SkillCheck
+				var sha, hash string
+				if s.Source.Kind == "git" {
+					c, sha, hash = checkGitSkill(s, f, heads)
+				} else {
+					c, sha, hash = checkSkill(s, f, asked, &limited)
+				}
 				omu.Lock()
 				out = append(out, c)
 				if sha != "" {
@@ -323,8 +326,12 @@ func CheckSkills() ([]SkillCheck, error) {
 					refs = append(refs, s.Source.Ref)
 				}
 			}
-			// and what the repository has added beside them since
+			// and what the repository has added beside them since: GitHub's
+			// list of its files says, which another host has no API for
 			for _, ref := range refs {
+				if skills[0].Source.Kind != "github" {
+					break
+				}
 				if found, ok := findNew(l, skills[0].Source.Repo, ref, f, &limited); ok {
 					newFound.Lock()
 					newFound.m[repoKey(skills[0].Source.Repo, ref)] = found
@@ -342,7 +349,9 @@ func CheckSkills() ([]SkillCheck, error) {
 		if l, err := load(); err == nil {
 			for _, s := range l.Skills {
 				k, ok := known[s.Name]
-				if ok && s.Source != nil && s.Source.Kind == "github" && s.Commit == "" && (s.Hash == "" || s.Hash == k[1]) {
+				// a git repository's commit is the whole repository's: a
+				// check that found the files the same at a later one keeps that
+				if ok && s.Source.remote() && (s.Commit == "" || s.Source.Kind == "git") && (s.Hash == "" || s.Hash == k[1]) {
 					s.Commit, s.Hash = k[0], k[1]
 				}
 			}
@@ -372,7 +381,7 @@ func checkSkill(s *Skill, f *fetcher, asked map[string]*commit, limited *atomic.
 	last := asked[key]
 	if last == nil {
 		if e := limited.Load(); e != nil {
-			c.Error, c.Limited = e.Error(), e.view()
+			c.Error, c.Limited = e.Error(), limitedView(*e)
 			return c, "", ""
 		}
 		var err error
@@ -381,7 +390,7 @@ func checkSkill(s *Skill, f *fetcher, asked map[string]*commit, limited *atomic.
 			var e errLimited
 			if errors.As(err, &e) {
 				limited.Store(&e)
-				c.Limited = e.view()
+				c.Limited = limitedView(e)
 			}
 			c.Error = err.Error()
 			return c, "", ""

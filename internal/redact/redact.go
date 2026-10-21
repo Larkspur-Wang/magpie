@@ -28,6 +28,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"unicode/utf8"
 )
 
 // Options says what to mask.
@@ -40,6 +41,14 @@ type Options struct {
 	// id, where the user chose; one not in it is as its Category.On says.
 	// None of them is masked while Personal is off.
 	Kinds map[string]bool
+	// Model, where set, finds more in the texts to mask (model.go)
+	Model Model
+
+	// Seen, where set, is told of each value masked
+	Seen func(Hit)
+
+	// found are the spans Model found, by text, for one request's texts
+	found map[string][]Found
 }
 
 // covers says o masks what a rule of category cat finds: "" are the
@@ -85,6 +94,8 @@ type rule struct {
 	back, ahead int
 	// cat is what turns the rule on (Options.covers): "" the secrets
 	cat string
+	// yours is a rule the user wrote (customRules)
+	yours bool
 	// anyGroup takes the first group that matched, for a pattern with a
 	// group in each of its alternatives
 	anyGroup bool
@@ -198,12 +209,50 @@ func secretValue(v string) bool {
 
 func realEmail(v string) bool {
 	host := strings.ToLower(v[strings.LastIndexByte(v, '@')+1:])
+	if fileHost(host) {
+		return false
+	}
 	for _, fake := range []string{"example.com", "example.org", "example.net", "localhost", ".test", ".invalid", ".example"} {
 		if host == strings.TrimPrefix(fake, ".") || strings.HasSuffix(host, fake) {
 			return false
 		}
 	}
 	return !strings.HasPrefix(host, "noreply") && !strings.Contains(v, "noreply@")
+}
+
+// fileExt are file name extensions that are no top-level domain, so
+// what ends in one is a file's name and not an address: an image a Mac
+// saved at twice its size, 261020_14-16-11@2x.jpg, went to the model as
+// {{EMAIL_…}} and Pi could no longer read the file (#3029).
+// Other files are named so too (intro@2x.mp4, strings@base.json), and
+// none of these is a domain either (IANA's list, checked 2026-10-21).
+var fileExt = map[string]bool{
+	"jpg": true, "jpeg": true, "png": true, "gif": true, "webp": true, "svg": true, "heic": true, "heif": true,
+	"avif": true, "bmp": true, "tif": true, "tiff": true, "ico": true, "icns": true, "pdf": true,
+	"svgz": true, "apng": true, "jxl": true, "psd": true, "eps": true, "lottie": true,
+	"mp4": true, "m4v": true, "webm": true, "mkv": true, "avi": true, "mp3": true, "m4a": true, "wav": true,
+	"ogg": true, "flac": true, "aac": true, "ttf": true, "otf": true, "woff": true, "woff2": true, "eot": true,
+	"json": true, "yaml": true, "yml": true, "toml": true, "xml": true, "txt": true, "csv": true, "tsv": true,
+	"log": true, "html": true, "htm": true, "css": true, "scss": true, "less": true, "js": true, "mjs": true,
+	"cjs": true, "jsx": true, "ts": true, "tsx": true, "doc": true, "docx": true, "xls": true, "xlsx": true,
+	"ppt": true, "pptx": true, "gz": true, "tgz": true, "tar": true, "rar": true, "7z": true, "dmg": true,
+}
+
+// scaleExt are file extensions that are top-level domains too (.zip,
+// .mov, .md, .map): a name ending in one is a file's only with a scale
+// before it, icon@2x.zip, intro@1.5x.mov, while ops@files.zip is an
+// address.
+var scaleExt = map[string]bool{"zip": true, "mov": true, "md": true, "map": true}
+
+var scaleRe = regexp.MustCompile(`^[0-9]+(?:\.[0-9]+)?x$`)
+
+// fileHost says host, what follows the @ of what looks like an address,
+// is the end of a file's name: an extension no domain has (fileExt), or a
+// scale and an extension that is a domain too (scaleExt).
+func fileHost(host string) bool {
+	dot := strings.LastIndexByte(host, '.')
+	ext := host[dot+1:]
+	return fileExt[ext] || dot > 0 && scaleExt[ext] && scaleRe.MatchString(host[:dot])
 }
 
 func chineseID(v string) bool {
@@ -243,6 +292,7 @@ func luhn(v string) bool {
 var (
 	mu      sync.RWMutex
 	values  = map[string]string{} // placeholder → value
+	kinds   = map[string]bool{}   // the kinds of values, for wordTail
 	keyOf   []byte
 	keyPath string // guarded by mu, as keyOf is
 )
@@ -313,6 +363,7 @@ func placeholder(kind, v string) string {
 			reindexKnown()
 		}
 		values[p] = v
+		kinds[kind] = true
 		addKnown(p, v)
 	}
 	mu.Unlock()
@@ -324,10 +375,66 @@ func placeholder(kind, v string) string {
 type span struct {
 	start, end int
 	kind       string
+	by         string // which finder found it: one of the By constants
+}
+
+// Which finder found a value (Hit.By): magpie's rules, the user's own
+// rules, the user's words, the local model (with the Chinese names it
+// brings, which run only with it), or a value masked before (known.go).
+const (
+	ByRule  = "rule"
+	ByYours = "yours"
+	ByWord  = "word"
+	ByModel = "model"
+	ByKnown = "known"
+)
+
+// Hit is one value masked: its kind, the finder that found it, and the
+// placeholder it went as. It never holds the value itself.
+type Hit struct {
+	Kind, By, Placeholder string
+}
+
+// Value is the value behind placeholder p, while this run of magpie
+// remembers it.
+func Value(p string) (string, bool) {
+	mu.RLock()
+	defer mu.RUnlock()
+	v, ok := values[p]
+	return v, ok
+}
+
+// Hint is as much of v as may be kept where v itself may not: its first
+// character (the first few of a key's, which name its kind: sk-, ghp_)
+// and how many characters it has.
+func Hint(kind, v string) (head string, n int) {
+	n = utf8.RuneCountInString(v)
+	if n < 2 {
+		return "", n
+	}
+	k := 1
+	if _, personal := kindCats[kind]; !personal && kind != "TERM" && n >= 16 {
+		// a key's prefix, up to where its random part starts
+		k = 0
+		for _, c := range v {
+			if k >= 4 || !strings.ContainsRune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_", c) {
+				break
+			}
+			k++
+			if c == '-' || c == '_' {
+				break
+			}
+		}
+		k = max(k, 1)
+	}
+	r := []rune(v)
+	return string(r[:k]), n
 }
 
 // Mask swaps what o covers in s for placeholders, and says how many.
-func Mask(s string, o Options) (string, int) { return mask(s, o, placeholder) }
+func Mask(s string, o Options) (string, int) {
+	return mask(s, withModel(o, []string{s}), placeholder)
+}
 
 // mask swaps what o covers in s for what put makes of each value.
 func mask(s string, o Options, put func(kind, v string) string) (string, int) {
@@ -344,7 +451,7 @@ func mask(s string, o Options, put func(kind, v string) string) (string, int) {
 			if j < 0 {
 				break
 			}
-			found = append(found, span{i + j, i + j + len(w), "TERM"})
+			found = append(found, span{i + j, i + j + len(w), "TERM", ByWord})
 			i += j + len(w)
 		}
 	}
@@ -379,12 +486,12 @@ func mask(s string, o Options, put func(kind, v string) string) (string, int) {
 				took := false
 				for g, kind := range r.groups {
 					if a, b := m[2*g+2], m[2*g+3]; a >= 0 && r.takes(s, a, b, r.groupOK[g]) {
-						found = append(found, span{a, b, kind})
+						found = append(found, span{a, b, kind, r.by()})
 						took = true
 					}
 				}
 				if took {
-					split = append(split, span{m[2], m[1], ""})
+					split = append(split, span{m[2], m[1], "", ""})
 				}
 				continue
 			}
@@ -407,7 +514,7 @@ func mask(s string, o Options, put func(kind, v string) string) (string, int) {
 				ok = nil
 			}
 			if r.takes(s, a, b, ok) {
-				found = append(found, span{a, b, r.kind})
+				found = append(found, span{a, b, r.kind, r.by()})
 			}
 		}
 	}
@@ -418,8 +525,17 @@ func mask(s string, o Options, put func(kind, v string) string) (string, int) {
 	}
 	// after the rules', so where a rule finds the same value it keeps the
 	// kind it has always had
+	found = append(found, modelSpans(s, o)...)
 	found = append(found, knownSpans(s, o)...)
-	return apply(s, found, put)
+	return apply(s, found, put, o.Seen)
+}
+
+// by is the finder r is, for Hit.By.
+func (r rule) by() string {
+	if r.yours {
+		return ByYours
+	}
+	return ByRule
 }
 
 // matches are r's matches in s, lower being lowerASCII(s), as
@@ -503,7 +619,8 @@ func (r rule) takes(s string, a, b int, ok func(string) bool) bool {
 
 // apply swaps each of found in s for what put makes of its value, the
 // first and longest where they overlap, nothing inside a placeholder.
-func apply(s string, found []span, put func(kind, v string) string) (string, int) {
+// seen, where set, is told of each.
+func apply(s string, found []span, put func(kind, v string) string, seen func(Hit)) (string, int) {
 	if len(found) == 0 {
 		return s, 0
 	}
@@ -532,7 +649,11 @@ func apply(s string, found []span, put func(kind, v string) string) (string, int
 			continue
 		}
 		b.WriteString(s[last:f.start])
-		b.WriteString(put(f.kind, s[f.start:f.end]))
+		p := put(f.kind, s[f.start:f.end])
+		b.WriteString(p)
+		if seen != nil {
+			seen(Hit{f.kind, f.by, p})
+		}
 		last, n = f.end, n+1
 	}
 	b.WriteString(s[last:])
@@ -550,24 +671,94 @@ func containsAny(s string, subs []string) bool {
 
 // ---- restoring ------------------------------------------------------------------
 
+// placeholderBody is a placeholder without its braces, as a model may write
+// one back: API_KEY_k3v9x2mq, phone_b5puzbfv, PHONE_B5PUZBFV.
+var placeholderBody = regexp.MustCompile(`[A-Za-z][A-Za-z0-9_]*_[A-Za-z2-7]{8}`)
+
 // Restore puts the values back in s. escaped is for text that is itself
 // JSON (a tool call's arguments), where a value goes in escaped.
+//
+// A model doesn't always write a placeholder back as it was given: it
+// writes {{ PHONE_b5puzbfv }} as a template has it, drops a brace, or the
+// braces, or changes the case. Any of those is put back too when what is
+// left names a placeholder this magpie made: its kind and the 8 of its
+// hash, which no other text has by chance (shensmart on Discord).
 func Restore(s string, escaped bool) string {
-	if !strings.Contains(s, "{{") {
+	if !strings.Contains(s, "_") {
 		return s
 	}
 	mu.RLock()
 	defer mu.RUnlock()
-	return placeholderRe.ReplaceAllStringFunc(s, func(p string) string {
-		v, ok := values[p]
+	if len(values) == 0 {
+		return s
+	}
+	var b strings.Builder
+	last := 0
+	for _, m := range placeholderBody.FindAllStringIndex(s, -1) {
+		a, z := m[0], m[1]
+		if a < last || a > 0 && isWordByte(s[a-1]) || z < len(s) && isWordByte(s[z]) {
+			continue
+		}
+		v, ok := values[canonical(s[a:z])]
 		if !ok {
-			return p
+			continue
 		}
+		a, z = braces(s, a, z)
+		if a < last {
+			continue
+		}
+		b.WriteString(s[last:a])
 		if escaped {
-			return jsonEscape(v)
+			v = jsonEscape(v)
 		}
-		return v
-	})
+		b.WriteString(v)
+		last = z
+	}
+	if last == 0 {
+		return s
+	}
+	b.WriteString(s[last:])
+	return b.String()
+}
+
+// canonical is the placeholder Mask wrote for body, whatever its case.
+func canonical(body string) string {
+	cut := len(body) - 8
+	return "{{" + strings.ToUpper(body[:cut]) + strings.ToLower(body[cut:]) + "}}"
+}
+
+func isWordByte(c byte) bool {
+	return c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '_'
+}
+
+// braces widens s[a:z], a placeholder's body, over the braces the model
+// wrote around it, and the spaces inside them: both of {{ and }}, or one
+// of them dropped ({{X} or {X}}), or just {{ or just }}. A single brace
+// on one side alone is the text's own ({X as in code) and stays.
+func braces(s string, a, z int) (int, int) {
+	la, l := a, 0
+	for la > 0 && (s[la-1] == ' ' || s[la-1] == '\t') {
+		la--
+	}
+	for l < 2 && la > 0 && s[la-1] == '{' {
+		la--
+		l++
+	}
+	rz, r := z, 0
+	for rz < len(s) && (s[rz] == ' ' || s[rz] == '\t') {
+		rz++
+	}
+	for r < 2 && rz < len(s) && s[rz] == '}' {
+		rz++
+		r++
+	}
+	if l == 2 || l == 1 && r >= 1 {
+		a = la
+	}
+	if r == 2 || r == 1 && l >= 1 {
+		z = rz
+	}
+	return a, z
 }
 
 // maxPlaceholder is the longest placeholder Mask writes: {{, a kind (a
@@ -575,36 +766,78 @@ func Restore(s string, escaped bool) string {
 const maxPlaceholder = len("{{") + maxKind + len("_") + 8 + len("}}")
 
 // partialTail is how much of the end of s may be the start of a
-// placeholder the next piece of a stream finishes.
+// placeholder the next piece of a stream finishes, in any of the ways
+// Restore takes one back: {{API_, {{ phone_b5, PHONE_b5puzbfv} — or, with
+// no brace before it, a last word that starts as a placeholder this magpie
+// made does (PHO, PHONE_b5pu), or is one whose }} may still come.
 func partialTail(s string) int {
+	if n := braceTail(s); n > 0 {
+		return n
+	}
+	return wordTail(s)
+}
+
+// braceTail is a tail from {, or {{, on: then spaces, a placeholder's body
+// or the start of one, then spaces and one } at most.
+func braceTail(s string) int {
 	i := strings.LastIndexByte(s, '{')
 	if i < 0 {
 		return 0
 	}
-	// the {{ that opens it
 	if i > 0 && s[i-1] == '{' {
 		i--
 	}
 	t := s[i:]
-	if len(t) >= maxPlaceholder || strings.Contains(t, "}}") {
+	if len(t) >= maxPlaceholder+4 || strings.Contains(t, "}}") {
 		return 0
 	}
-	// {, {{, {{A…, {{API_KEY_ab…, {{API_KEY_abcdefgh}
-	if t == "{" || t == "{{" {
-		return len(t)
+	body := strings.TrimLeft(t, "{")
+	body = strings.TrimLeft(body, " \t")
+	if body == "" {
+		return len(t) // {, {{, {{␠
 	}
-	if !strings.HasPrefix(t, "{{") {
+	if c := body[0]; !(c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z') {
 		return 0
 	}
-	body := strings.TrimSuffix(t[2:], "}")
-	if body == "" || body[0] < 'A' || body[0] > 'Z' {
+	j := 0
+	for j < len(body) && isWordByte(body[j]) {
+		j++
+	}
+	rest := strings.TrimLeft(body[j:], " \t")
+	if rest != "" && rest != "}" {
 		return 0
 	}
-	for j := 0; j < len(body); j++ {
-		c := body[j]
-		if !(c >= 'A' && c <= 'Z' || c == '_' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9') {
-			return 0
-		}
+	if j < len(body) && placeholderBody.FindString(body[:j]) != body[:j] {
+		return 0 // a space or a brace after something that is no placeholder
 	}
 	return len(t)
+}
+
+// wordTail is the last word of s, where it may be a placeholder's body as
+// a model writes one without braces: the start of one of the kinds this
+// magpie has made placeholders of, up to the 8 of its hash. A word of
+// text that only starts like a kind is held for an event and then goes
+// on, unchanged.
+func wordTail(s string) int {
+	i := len(s)
+	for i > 0 && isWordByte(s[i-1]) {
+		i--
+	}
+	w := s[i:]
+	if w == "" || len(w) > maxKind+9 || !(w[0] >= 'A' && w[0] <= 'Z') {
+		return 0
+	}
+	u := strings.ToUpper(w)
+	mu.RLock()
+	defer mu.RUnlock()
+	for k := range kinds {
+		k += "_"
+		if strings.HasPrefix(k, u) {
+			return len(w)
+		}
+		if strings.HasPrefix(u, k) && len(u)-len(k) <= 8 && strings.Trim(strings.ToLower(u[len(k):]), "abcdefghijklmnopqrstuvwxyz234567") == "" {
+			return len(w)
+		}
+	}
+	return 0
 }

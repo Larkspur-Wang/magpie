@@ -14,7 +14,7 @@ import (
 // Rename gives a provider another id, the one its models are picked by
 // (<id>/<model>). What magpie keeps that names it by id follows: the
 // routing groups it is in and their rules and classifiers, the other
-// providers' fallbacks, and which agents are shown it. The old id stays
+// providers' fallbacks, which agents are shown it, and its StepFun sign-in. The old id stays
 // with it (Was), so an agent still running on a config that names it the
 // old way reaches it, and its usage so far is counted with it; the agents'
 // own files are the agent package's to rewrite (agent.RenameProvider).
@@ -47,6 +47,8 @@ func Rename(from, to string) error {
 		return errors.New(`"magpie" is what agents call the gateway itself; pick another id`)
 	case to == strings.TrimSuffix(GroupPrefix, "/"):
 		return errors.New(`"group" starts the ids of routing groups; pick another id`)
+	case to == autoID:
+		return errAutoID
 	case subscriptionID(to):
 		return fmt.Errorf("%q is the id of the %s subscription; pick another", to, to)
 	}
@@ -91,6 +93,7 @@ func Rename(from, to string) error {
 		for k, m := range g.Off {
 			g.Off[k] = renamedRef(m, from, to)
 		}
+		g.Weights = renamedWeights(g.Weights, func(m string) string { return renamedRef(m, from, to) })
 		g.Classifier = renamedRef(g.Classifier, from, to)
 		g.Pick = renamedRef(g.Pick, from, to)
 	}
@@ -98,6 +101,10 @@ func Rename(from, to string) error {
 	os.Rename(catalog.LivePath(from), catalog.LivePath(to))
 	os.Rename(catalog.LivePath(decisionsID(from)), catalog.LivePath(decisionsID(to)))
 	if err := store(f); err != nil {
+		return err
+	}
+	// so is its StepFun sign-in, kept by provider id
+	if err := renameStepFun(from, to); err != nil {
 		return err
 	}
 	s := settings.Load()

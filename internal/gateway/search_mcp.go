@@ -12,7 +12,6 @@ import (
 	"strings"
 
 	"github.com/yetone/magpie/internal/access"
-	"github.com/yetone/magpie/internal/budget"
 )
 
 // magpie's web search, the one a model that can't search is given
@@ -23,7 +22,7 @@ import (
 // POST. It is a gateway route like the others: this computer calls it with
 // any key, another one only while magpie is shared and with an enabled
 // gateway key (lanGuard), a gateway key's limit holds each search
-// (budget.Reserve), and a web page is turned away, as the MCP spec has a
+// (reserveFor), and a web page is turned away, as the MCP spec has a
 // server check Origin.
 
 // SearchMCPPath is where the web search MCP server is served. It has two
@@ -44,15 +43,22 @@ type mcpMessage struct {
 }
 
 func (s *Server) searchMCP(w http.ResponseWriter, r *http.Request) {
+	serveMCP(w, r, "magpie's web search", 1<<20, s.searchMCPCall)
+}
+
+// serveMCP answers the JSON-RPC messages POSTed to one of magpie's own MCP
+// servers (what names it in a refusal) with call, a body up to limit bytes
+// long: guarded as a gateway route, and a web page turned away.
+func serveMCP(w http.ResponseWriter, r *http.Request, what string, limit int64, call func(*http.Request, mcpMessage) (any, map[string]any)) {
 	if !local(r) && !sharedWith(r) {
-		http.Error(w, "magpie's web search is served to another machine only when magpie is shared on the local network and the request carries a gateway key (Authorization: Bearer <key>)", http.StatusForbidden)
+		http.Error(w, what+" is served to another machine only when magpie is shared on the local network and the request carries a gateway key (Authorization: Bearer <key>)", http.StatusForbidden)
 		return
 	}
 	// a page on this computer (localhost) gets past corsGuard; only one the
 	// user listed in Settings, which corsGuard held to a gateway key, may
 	// call this
 	if o := r.Header.Get("Origin"); o != "" && !corsAllowed(o) {
-		http.Error(w, "magpie's web search MCP server answers agents, not web pages", http.StatusForbidden)
+		http.Error(w, what+" MCP server answers agents, not web pages", http.StatusForbidden)
 		return
 	}
 	if r.Method != http.MethodPost {
@@ -61,14 +67,14 @@ func (s *Server) searchMCP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "POST JSON-RPC messages here (MCP Streamable HTTP)", http.StatusMethodNotAllowed)
 		return
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	body, ok := readMCPBody(w, r, limit)
+	if !ok {
 		return
 	}
 	body = bytes.TrimSpace(body)
 	batch := len(body) > 0 && body[0] == '['
 	var msgs []mcpMessage
+	var err error
 	if batch {
 		err = json.Unmarshal(body, &msgs)
 	} else {
@@ -87,7 +93,7 @@ func (s *Server) searchMCP(w http.ResponseWriter, r *http.Request) {
 		if len(m.ID) == 0 || bytes.Equal(m.ID, []byte("null")) || m.Method == "" {
 			continue
 		}
-		result, rpcErr := s.searchMCPCall(r, m)
+		result, rpcErr := call(r, m)
 		reply := map[string]any{"jsonrpc": "2.0", "id": m.ID}
 		if rpcErr != nil {
 			reply["error"] = rpcErr
@@ -111,19 +117,11 @@ func (s *Server) searchMCP(w http.ResponseWriter, r *http.Request) {
 func (s *Server) searchMCPCall(r *http.Request, m mcpMessage) (any, map[string]any) {
 	switch m.Method {
 	case "initialize":
-		var p struct {
-			ProtocolVersion string `json:"protocolVersion"`
-		}
-		json.Unmarshal(m.Params, &p)
-		v := searchMCPVersions[0]
-		if slices.Contains(searchMCPVersions, p.ProtocolVersion) {
-			v = p.ProtocolVersion
-		}
 		return map[string]any{
-			"protocolVersion": v,
+			"protocolVersion": mcpVersion(m),
 			"capabilities":    map[string]any{"tools": map[string]any{}},
 			"serverInfo":      map[string]any{"name": "magpie-web-search", "title": "Magpie Web Search", "version": Version},
-			"instructions":    "web_search searches the web with the search magpie gives its models: a provider that can search, or the search APIs set up in magpie (Settings → Models → Web search).",
+			"instructions":    "web_search searches the web with the search magpie gives its models: a provider that can search, or the search APIs set up in magpie (Settings → Models → Web search). web_fetch reads a page it found, by its URL.",
 		}, nil
 	case "ping":
 		return map[string]any{}, nil
@@ -135,27 +133,47 @@ func (s *Server) searchMCPCall(r *http.Request, m mcpMessage) (any, map[string]a
 			"description": t.Description,
 			"inputSchema": t.Schema,
 			"annotations": map[string]any{"readOnlyHint": true, "openWorldHint": true},
-		}}}, nil
+		}, fetchTool()}}, nil
 	case "tools/call":
 		var p struct {
 			Name      string `json:"name"`
 			Arguments struct {
 				Query string `json:"query"`
+				fetchArgs
 			} `json:"arguments"`
 		}
 		if err := json.Unmarshal(m.Params, &p); err != nil {
 			return nil, map[string]any{"code": -32602, "message": "invalid params: " + err.Error()}
 		}
-		if p.Name != searchMCPTool {
-			return nil, map[string]any{"code": -32602, "message": "unknown tool " + p.Name + ": this server has " + searchMCPTool}
+		var said string
+		var err error
+		switch p.Name {
+		case searchMCPTool:
+			said, err = s.searchMCPRun(r, strings.TrimSpace(p.Arguments.Query))
+		case fetchMCPTool:
+			said, err = s.fetchMCPRun(r, p.Arguments.fetchArgs)
+		default:
+			return nil, map[string]any{"code": -32602, "message": "unknown tool " + p.Name + ": this server has " + searchMCPTool + " and " + fetchMCPTool}
 		}
-		said, err := s.searchMCPRun(r, strings.TrimSpace(p.Arguments.Query))
 		if err != nil {
 			return toolResult(err.Error(), true), nil
 		}
 		return toolResult(said, false), nil
 	}
 	return nil, map[string]any{"code": -32601, "message": "method not found: " + m.Method}
+}
+
+// mcpVersion is the MCP version an initialize is answered in: the one it
+// asks for when the server speaks it, else the newest.
+func mcpVersion(m mcpMessage) string {
+	var p struct {
+		ProtocolVersion string `json:"protocolVersion"`
+	}
+	json.Unmarshal(m.Params, &p)
+	if slices.Contains(searchMCPVersions, p.ProtocolVersion) {
+		return p.ProtocolVersion
+	}
+	return searchMCPVersions[0]
 }
 
 func toolResult(text string, isError bool) map[string]any {
@@ -173,9 +191,9 @@ func (s *Server) searchMCPRun(r *http.Request, query string) (string, error) {
 	if query == "" {
 		return "", searchMCPError("web_search needs a query")
 	}
-	release, refused := budget.Reserve(access.Caller(r.Context()), int64(len(query)), "", limitClock())
-	if refused != nil {
-		return "", refused
+	release, err := reserveFor(access.Caller(r.Context()), int64(len(query)), "", limitClock())
+	if err != nil {
+		return "", err
 	}
 	defer release()
 	ctx := context.WithValue(r.Context(), searchForKey{}, &CallFor{Agent: callerOf(r).agent, MCP: true})
@@ -190,5 +208,34 @@ func (s *Server) searchMCPRun(r *http.Request, query string) (string, error) {
 		}
 		return "", searchMCPError(msg)
 	}
-	return said, nil
+	// what was masked on the way out (maskedQuery, or the searcher's
+	// request) is the agent's own: it gets it back
+	return restored(said, false), nil
+}
+
+// readMCPBody reads a request body of at most limit bytes, answering 413
+// for a longer one. A LimitReader alone ends at the limit as if the body
+// had, so a valid message padded past it was read as its prefix and run
+// (#1766); one byte more tells a body that ended from one that was cut.
+func readMCPBody(w http.ResponseWriter, r *http.Request, limit int64) ([]byte, bool) {
+	if r.Body == nil {
+		return nil, true
+	}
+	tooLarge := func() ([]byte, bool) {
+		w.Header().Set("Connection", "close")
+		http.Error(w, "the request body is longer than this server takes", http.StatusRequestEntityTooLarge)
+		return nil, false
+	}
+	if r.ContentLength > limit {
+		return tooLarge()
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, limit+1))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return nil, false
+	}
+	if int64(len(body)) > limit {
+		return tooLarge()
+	}
+	return body, true
 }

@@ -49,6 +49,10 @@ func mirasimQuota(s mirasim.RelayStatus, now time.Time) SubscriptionQuota {
 			v.Name, v.Span, v.Model = "Claude 7 days", 7*24*time.Hour, "claude-"
 		case "7d_fable":
 			v.Name, v.Span, v.Model = "Fable 7 days", 7*24*time.Hour, "fable"
+		case "30d":
+			// the platform's rolling allowance on a plan that reports one
+			// window for every model (Mirasim max)
+			v.Name, v.Span = "30 days", 30*24*time.Hour
 		default:
 			// An unknown scoped window is visible, but cannot constrain every model.
 			v.Aside = w.ModelScoped

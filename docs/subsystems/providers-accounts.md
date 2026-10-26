@@ -9,6 +9,12 @@ The gateway can send a request to three kinds of upstream:
 Package `internal/provider` holds all three, the routing groups built over
 them, and what is left of each one's allowance.
 
+For automatic outbound proxy selection (`internal/netproxy.For`), an
+environment `NO_PROXY` match means direct and never falls through to the
+operating system's proxy. An explicit Settings or per-provider proxy choice
+retains its documented precedence. `TestNoProxyStopsSystemFallback` and the
+GUI's `TestProxyCheckSaysAProxyPassedBy` cover the boundary.
+
 The native Mirasim catalog (`RefreshMirasim`, `internal/provider/mirasim.go`)
 keeps platform model IDs and their context and effort metadata. It excludes
 `profile:` entries: those are the desktop's external-provider routes, not

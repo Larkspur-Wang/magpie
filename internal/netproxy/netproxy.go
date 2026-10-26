@@ -253,6 +253,11 @@ func For(u *url.URL) (*url.URL, error) {
 	default:
 		return Parse(s)
 	}
+	// An environment bypass is a direct choice, not permission to try
+	// the system proxy after the environment's proxy was passed by.
+	if noProxy(u.Hostname(), envOf("NO_PROXY", "no_proxy")) {
+		return nil, nil
+	}
 	if p, err := fromEnv(u); p != nil || err != nil {
 		return p, err
 	}

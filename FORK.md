@@ -26,7 +26,11 @@ Mirasim 支持和几个供应商插件。本文说明这个 fork 怎么组织、
 | [`plugins/cohub`](plugins/cohub/README.md) | 接入 Cohub 的模型，仅限纯文本对话 | 本机安装的 `@neta-art/cohub-cli`，自动选用最新版 |
 | [`plugins/antigravity`](plugins/antigravity/README.md) | 包装 Antigravity 社区插件，补上原生额度 | `../magpie-antigravity-auth`，**钉在指定 commit** |
 
-插件用 Magpie 的 OpenCode 插件协议，和上游代码完全解耦，上游怎么改都不会冲突。新的供应商能做成插件的，都优先做成插件。
+插件用 Magpie 的 OpenCode 插件协议，通常不产生核心代码的合并冲突，但仍依赖插件宿主协议、供应商接口和所包装插件的内部接口，不能保证永远无需适配。新的供应商能做成插件的，都优先做成插件；依赖钉版本，升级先跑契约测试和隔离的真实工具往返。
+
+当前启用的 Antigravity 发现适配器在 `plugins/antigravity-discovery-20261024/`，
+Mirasim GPT 适配器在 `plugins/mirasim-gpt/`。依赖与提取边界见
+[`docs/fork-maintenance-2026-10-27.md`](docs/fork-maintenance-2026-10-27.md)。
 
 ### 2. Mirasim 核心补丁
 
@@ -40,7 +44,7 @@ Mirasim 目前**做不成插件**，原因有两个：
 
 为了合并省事，Mirasim 的逻辑都放在**新文件**里（`internal/mirasim/`、`internal/provider/mirasim*.go`、
 `internal/gateway/mirasim.go`、`mirasim_cli.go` 等），上游原有文件只加最少的接入点。
-当前只改了 19 个上游文件，共 +155/−10 行，合并冲突只可能出在这些地方：
+下面的数量会随上游和产品分支变化，不应拿旧快照当实时结果。用当前引用重新计算：
 
 ```sh
 git diff --name-status main...feat/mirasim | grep '^M'   # 被改动的上游文件
@@ -56,11 +60,13 @@ git diff --stat main...feat/mirasim                       # 全部差异
 
 `.github/workflows/upstream-watch.yml` 每天 09:17（UTC+8）运行一次，也可以在 Actions 页手动触发：
 
-- 把 `main` 同步到上游（GitHub 的 fork 同步碰到上游改了工作流文件时会失败，这时由本地脚本补上）；
-- 试合并到 `feat/mirasim`，看会不会冲突；
-- 把结果写进一个固定的 **“Upstream updates” Issue**；没有新提交时自动关闭。
+- 获取上游引用，用 `git merge-tree` 试合并，不检出或修改产品文件；
+- 以 Actions Summary 和保留 30 天的 JSON/Markdown artifact 为主要报告；
+- 尝试更新固定的 **“Upstream updates” Issue**，无权限时仍保留主要报告；没有新提交时尝试关闭 Issue。
 
-它**只报告，不往 `feat/mirasim` 推代码**。合并要在本地跑完测试再推。
+它**只报告，不往 `main` 或 `feat/mirasim` 推代码，也不安装版本**。
+旧的自动镜像因 workflow 权限失败而移除，`main` 的纯镜像由维护者本地快进。
+合并要在本地跑完测试再推；活跃工作区有未提交改动时，改用独立 worktree 做升级，不自动 stash。
 注意：GitHub 会在仓库 60 天没有动静后自动停用定时工作流，到时去 Actions 页重新启用即可。
 
 ### 本地同步

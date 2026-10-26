@@ -36,6 +36,12 @@ type RelayWindow struct {
 	ResetAt           string   `json:"resetAt"`
 	ResetAfterSeconds int64    `json:"resetAfterSeconds"`
 	ModelScoped       bool     `json:"modelScoped"`
+	// Used and Budget are the platform's own count of the window: credits
+	// spent of credits held. UsedPercent is them as a share, rounded to a
+	// tenth, so they carry the reading the percentage loses (62.39 of
+	// 47235 is 0.1%, which alone reads as nothing spent).
+	Used   *float64 `json:"used"`
+	Budget *float64 `json:"budget"`
 }
 
 func ParseRelayStatus(data []byte) (RelayStatus, error) {

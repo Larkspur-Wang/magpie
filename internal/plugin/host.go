@@ -26,6 +26,7 @@ import (
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/filememo"
 	"github.com/yetone/magpie/internal/lastgood"
+	"github.com/yetone/magpie/internal/mirasim"
 	"github.com/yetone/magpie/internal/netproxy"
 	"github.com/yetone/magpie/internal/settings"
 )
@@ -1632,7 +1633,25 @@ func hostEnv(env []string) []string {
 			out = append(out, e)
 		}
 	}
+	// Mirasim signs each request with the desktop's version, so a plugin
+	// that keeps one of its own is refused once the app moves on. Hand the
+	// installed version over; a plugin that doesn't read it is unaffected.
+	if _, set := lookupEnv(out, "MIRASIM_CLIENT_VERSION"); !set {
+		if v := mirasim.DesktopVersion(); v != "" {
+			out = append(out, "MIRASIM_CLIENT_VERSION="+v)
+		}
+	}
 	return out
+}
+
+// lookupEnv is whether env names key: a plugin's own setting wins.
+func lookupEnv(env []string, key string) (string, bool) {
+	for _, e := range env {
+		if k, v, _ := strings.Cut(e, "="); strings.EqualFold(k, key) {
+			return v, true
+		}
+	}
+	return "", false
 }
 
 // Fetch sends r through the provider's plugin — its loader's fetch, or

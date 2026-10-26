@@ -189,3 +189,49 @@ func run(ctx context.Context, cmd *exec.Cmd) error {
 	}
 	return err
 }
+
+// DesktopVersion is the version of the Mirasim desktop the relay signs for.
+// A plugin that signs with a version of its own is refused once the app
+// moves on, so this has to name the build actually running.
+//
+// The desktop hands that to its children as MIRASIM_APP_VERSION, the build
+// it is running. The staged app directory's state.json only records what was
+// last installed there, and it lags: an app updated in place leaves the
+// build before it named. So the desktop's own answer wins, and state.json
+// stands in only when the desktop gave none (magpie started outside it).
+// Empty when neither says, leaving the caller's own default.
+func DesktopVersion() string {
+	if v := versionName(os.Getenv("MIRASIM_APP_VERSION")); v != "" {
+		return v
+	}
+	root := os.Getenv("MIRASIM_HOME")
+	if root == "" {
+		home, _ := os.UserHomeDir()
+		root = filepath.Join(home, ".mirasim")
+	}
+	var state struct {
+		Good string `json:"good"`
+	}
+	if data, err := os.ReadFile(filepath.Join(root, "app", "state.json")); err == nil {
+		_ = json.Unmarshal(data, &state)
+	}
+	if good := versionName(state.Good); good != "" {
+		if _, err := os.Stat(filepath.Join(root, "app", good, "payload.json")); err == nil {
+			return good
+		}
+	}
+	return ""
+}
+
+// versionName is v when it can be a version and nothing else: a build name,
+// never a path or a value smuggled in through state.json.
+func versionName(v string) string {
+	v = strings.TrimSpace(v)
+	if v == "" || v == "." || v == ".." {
+		return ""
+	}
+	if filepath.Base(v) != v || strings.ContainsAny(v, `/\`) || strings.ContainsAny(v, " \t\r\n=") {
+		return ""
+	}
+	return v
+}

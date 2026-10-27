@@ -2,13 +2,14 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
-const { chromium } = require("playwright");
+const { chromium, webkit } = require("playwright");
 const assets = path.resolve(__dirname, "../assets");
 
+for (const [engine, browserType] of [["chromium", chromium], ["webkit", webkit]]) {
 for (const width of [900, 480]) {
-  for (const lang of ["en", "zh"]) {
-    test(`Mirasim settings ${lang} ${width}px`, async (t) => {
-      const browser = await chromium.launch({ executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH });
+  for (const lang of ["en", "zh", "zh-TW", "ja", "de"]) {
+    test(`Mirasim settings ${engine} ${lang} ${width}px`, async (t) => {
+      const browser = await browserType.launch({ executablePath: engine === "chromium" ? process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH : undefined });
       t.after(() => browser.close());
       const page = await browser.newPage({ viewport: { width, height: 800 }, reducedMotion: "reduce" });
       let settings = { lang, theme: "light", tray: "panel", mirasim: false, claudeLauncher: "", version: "mirasim-dev", dir: "/tmp/magpie", gateway: "http://127.0.0.1:3426", visionModels: [], imageGenModels: [], fx: { rate: 7.2, stale: false } };
@@ -60,8 +61,9 @@ for (const width of [900, 480]) {
       assert.deepEqual(errors, []);
       if (process.env.ARTIFACT_DIR) {
         await fs.mkdir(process.env.ARTIFACT_DIR, { recursive: true });
-        await page.screenshot({ path: path.join(process.env.ARTIFACT_DIR, `mirasim-${lang}-${width}.png`) });
+        await page.screenshot({ path: path.join(process.env.ARTIFACT_DIR, `mirasim-${engine}-${lang}-${width}.png`) });
       }
     });
   }
+}
 }

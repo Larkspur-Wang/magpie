@@ -22,6 +22,7 @@ import (
 
 	"github.com/yetone/magpie/internal/probelog"
 	"github.com/yetone/magpie/internal/settings"
+	"golang.org/x/net/http/httpproxy"
 )
 
 // Install routes http.DefaultTransport (and so http.DefaultClient) through
@@ -255,8 +256,11 @@ func For(u *url.URL) (*url.URL, error) {
 	}
 	// An environment bypass is a direct choice, not permission to try
 	// the system proxy after the environment's proxy was passed by.
-	if noProxy(u.Hostname(), envOf("NO_PROXY", "no_proxy")) {
-		return nil, nil
+	if no := envOf("NO_PROXY", "no_proxy"); no != "" && (u.Scheme == "http" || u.Scheme == "https") {
+		bypass := (&httpproxy.Config{HTTPProxy: "http://proxy.invalid", HTTPSProxy: "http://proxy.invalid", NoProxy: no}).ProxyFunc()
+		if p, err := bypass(u); err == nil && p == nil {
+			return nil, nil
+		}
 	}
 	if p, err := fromEnv(u); p != nil || err != nil {
 		return p, err

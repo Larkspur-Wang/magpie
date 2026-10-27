@@ -20,6 +20,9 @@ import (
 // leaves the machine: the name is .invalid and both servers are loopback.
 func proxyCheckRig(t *testing.T, exit ...string) (client *http.Client, proxyURL string, asked *int) {
 	t.Helper()
+	for _, key := range []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy"} {
+		t.Setenv(key, "")
+	}
 	answer := "fl=1\nip=203.0.113.9\nloc=US\n"
 	if len(exit) > 0 {
 		answer = exit[0]

@@ -8,6 +8,12 @@ import (
 	"github.com/yetone/magpie/internal/mirasim"
 )
 
+// relayNoResetHorizon is how far past now a window's reset can be and still
+// name a real renewal: the platform says "this does not renew" with a date a
+// century out (2126-09-29), and no subscription window runs past a year. A
+// reset beyond it is the sentinel, read as no reset at all.
+const relayNoResetHorizon = 10 * 365 * 24 * time.Hour
+
 func mirasimSubscriptionUsage(ctx context.Context) SubscriptionQuota {
 	s, err := mirasim.FetchRelayStatus(ctx)
 	if err != nil {
@@ -57,6 +63,21 @@ func mirasimQuota(s mirasim.RelayStatus, now time.Time) SubscriptionQuota {
 			// An unknown scoped window is visible, but cannot constrain every model.
 			v.Aside = w.ModelScoped
 		}
+		// The platform counts the window in credits and its percentage is
+		// that count rounded to a tenth: 81.19 credits of 47,235 is 0.2%,
+		// which alone reads as nothing spent. Carry the count beside the
+		// share so the card can say the figure the percentage loses.
+		if w.Used != nil && w.Budget != nil && *w.Budget > 0 {
+			v.Amount, v.Limit, v.Unit = *w.Used, *w.Budget, "credits"
+		}
+		// A window that does not renew says so with a reset a century out
+		// (2126-09-29, resetAfterSeconds 3153599267); counting down to it
+		// read "↻36499d23h". Nothing renews then, so leave the reset
+		// unknown instead of naming a date that means never. The seconds
+		// fall the same way, for a reply that gives them and no date.
+		if int64(v.ResetSecs) > int64(relayNoResetHorizon/time.Second) {
+			v.ResetSecs = 0
+		}
 		if w.ResetAt != "" {
 			t, err := time.Parse(time.RFC3339Nano, w.ResetAt)
 			if err != nil {
@@ -64,7 +85,11 @@ func mirasimQuota(s mirasim.RelayStatus, now time.Time) SubscriptionQuota {
 				q.Windows = []QuotaWindow{}
 				return q
 			}
-			v.ResetsAt = &t
+			if t.After(now.Add(relayNoResetHorizon)) {
+				v.ResetSecs = 0
+			} else {
+				v.ResetsAt = &t
+			}
 		}
 		q.Windows = append(q.Windows, v)
 	}

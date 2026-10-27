@@ -101,3 +101,69 @@ func TestNativeProbeRejectsEmptySuccessAndHidesDiagnostics(t *testing.T) {
 		}
 	}
 }
+
+// The relay checks a request's client version against its signature, so the
+// version has to be the desktop's own: a plugin keeping one of its own is
+// refused once the app updates.
+func TestDesktopVersionIsTheInstalledBuild(t *testing.T) {
+	h := t.TempDir()
+	t.Setenv("MIRASIM_HOME", h)
+	t.Setenv("MIRASIM_APP_VERSION", "")
+	if got := DesktopVersion(); got != "" {
+		t.Fatalf("no state read as %q", got)
+	}
+	app := filepath.Join(h, "app")
+	if err := os.MkdirAll(filepath.Join(app, "0.0.597"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(app, "0.0.597", "payload.json"), []byte(`{"version":"0.0.597"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(app, "state.json"), []byte(`{"good":"0.0.597","pending":"0.0.598"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := DesktopVersion(); got != "0.0.597" {
+		t.Fatalf("got %q, want the good build", got)
+	}
+	// a good build whose files are gone is no version at all
+	if err := os.Remove(filepath.Join(app, "0.0.597", "payload.json")); err != nil {
+		t.Fatal(err)
+	}
+	if got := DesktopVersion(); got != "" {
+		t.Fatalf("a missing build read as %q", got)
+	}
+}
+
+// The desktop passes the build it is running to its children, and an app
+// updated in place leaves state.json naming the build before it. Signing
+// with that stale one is what the relay refuses, so the desktop's own
+// answer has to win over the staged directory.
+func TestDesktopVersionPrefersTheRunningAppOverStagedState(t *testing.T) {
+	h := t.TempDir()
+	t.Setenv("MIRASIM_HOME", h)
+	app := filepath.Join(h, "app")
+	// state.json names the build installed there, one the app has moved past
+	if err := os.MkdirAll(filepath.Join(app, "0.0.595"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(app, "0.0.595", "payload.json"), []byte(`{}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(app, "state.json"), []byte(`{"good":"0.0.595","pending":"0.0.604"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MIRASIM_APP_VERSION", "0.0.622")
+	if got := DesktopVersion(); got != "0.0.622" {
+		t.Fatalf("got %q, want the running build over the staged one", got)
+	}
+	// and with the desktop silent the staged build is all there is
+	t.Setenv("MIRASIM_APP_VERSION", "")
+	if got := DesktopVersion(); got != "0.0.595" {
+		t.Fatalf("got %q, want the staged build", got)
+	}
+	// a value that is not a build name is no version, not a path
+	t.Setenv("MIRASIM_APP_VERSION", "../../etc")
+	if got := DesktopVersion(); got != "0.0.595" {
+		t.Fatalf("a path read as %q", got)
+	}
+}

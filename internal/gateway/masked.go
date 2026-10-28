@@ -43,6 +43,17 @@ func (h *maskHits) add(o maskHits) {
 	h.took += o.took
 }
 
+// sentOf is a masked body as noteMasked takes it: copied only for a
+// record that keeps it. With nothing masked no record is made, and one
+// over maskrec.SentMax keeps none of it, so a 45 MiB Codex turn was
+// copied whole on every request for nothing (#4004).
+func sentOf(h maskHits, body []byte) string {
+	if h.n == 0 && len(h.hits) == 0 || len(body) > maskrec.SentMax {
+		return ""
+	}
+	return string(body)
+}
+
 // noteMasked records what masking swapped in a request that went to a
 // vendor as sent: what it was (chat, search, image…), who sent it, the
 // route it is in the trace (0 for none), and the provider and model it
@@ -63,7 +74,7 @@ func noteMaskedUntil(r *http.Request, what string, h maskHits, sent string, rout
 	}
 	rec := maskrec.Record{What: what, Route: route, Provider: prov, Model: model, N: h.n}
 	if r != nil {
-		rec.Agent, rec.Session = agentOf(r), sessionOf(r.Header)
+		rec.Agent, rec.Session = callerOf(r).agent, sessionOf(r.Header)
 	}
 	rec.Values = valuesOf(h.hits)
 	rec.Snips = snipsOf(sent, h.hits)

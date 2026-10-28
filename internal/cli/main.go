@@ -21,6 +21,7 @@ import (
 	"github.com/yetone/magpie/internal/gateway"
 	"github.com/yetone/magpie/internal/imagemcp"
 	"github.com/yetone/magpie/internal/netproxy"
+	"github.com/yetone/magpie/internal/notices"
 	"github.com/yetone/magpie/internal/pluginrt"
 	"github.com/yetone/magpie/internal/proc"
 	"github.com/yetone/magpie/internal/profile"
@@ -150,6 +151,7 @@ const usage = `magpie — one place to pick every agent's model
   magpie update auto [on|off] [download|notify] [30m|1h|6h|24h]
                                   whether the app looks for updates by itself, how often (6h), and whether
                                   it downloads one at once or only says it is out (notify: for metered networks)
+  magpie licenses                 the third-party notices of what magpie is built with
 
 agents: claude (cc), codex, gemini, opencode (oc), mimocode, deveco, pi, goose, cursor, zed, copilot, crush, aside
 `
@@ -177,6 +179,9 @@ func Main(v string) {
 				return
 			case "-h", "--help", "help":
 				fmt.Print(usage)
+				return
+			case "licenses":
+				fmt.Print(notices.Text)
 				return
 			}
 		}
@@ -268,6 +273,11 @@ func run(args []string) error {
 		agent.SyncCatalogSettled()
 		catalog.Changed = was
 	}()
+	// what a shell's agy runs (agy_cli.go): every argument after run is
+	// agy's, --help too, and nothing is moved or started first
+	if ok, err := agyCmd(args); ok {
+		return err
+	}
 	// before anything is read, moved or started: --help on any command
 	// prints its usage and does nothing else
 	if helpAsked(args) {
@@ -336,6 +346,11 @@ func run(args []string) error {
 	// its ChatGPT sign-in rather than on that account (atom_Ray on X)
 	gateway.CodexSideModel = agent.CodexSideModel
 	gateway.CodexSideSet = agent.CodexSideSet
+	// the list the Codex app reads from a file beside the ChatGPT sign-in,
+	// its picker showing magpie's models only so (laddieyao on Discord),
+	// written again when the backend's list changes
+	agent.CodexDesktopList = gateway.CodexDesktopCatalog
+	gateway.CodexDesktopChanged = agent.SyncCatalogSoon
 	// the setup kept the same on every computer, by whichever serves
 	gateway.WhileServing = append(gateway.WhileServing, davsync.Run)
 	// and dsh's patch lists, which dsh reads live: a route left behind by
@@ -408,6 +423,9 @@ func run(args []string) error {
 		return nil
 	case "-v", "--version", "version":
 		fmt.Println("magpie", version)
+		return nil
+	case "licenses":
+		fmt.Print(notices.Text)
 		return nil
 	case "ls", "list":
 		// in the order the app lists them; those hidden there come last, dimmed
@@ -482,6 +500,13 @@ func run(args []string) error {
 		return claudeCodeCmd(args[1:])
 	}
 
+	// the agent of a plugin that is gone (deleted on disk) is no agent
+	// here, but what magpie stashed of its file puts it back (#3810)
+	if len(args) == 2 && strings.EqualFold(args[1], "default") {
+		if g, ok, err := agent.RestoreGone(args[0]); ok {
+			return goneDefault(args[0], g, err)
+		}
+	}
 	a, err := agent.Find(args[0])
 	if err != nil {
 		return err
@@ -659,6 +684,27 @@ func disconnect(a *agent.Agent) error {
 		if n := a.Notice(); n != "" {
 			fmt.Println(muted.Render("  ↻ " + n))
 		}
+	}
+	return nil
+}
+
+// goneDefault says what `magpie <id> default` did for the agent of a
+// plugin that is gone.
+func goneDefault(id string, g agent.Gone, err error) error {
+	for _, p := range g.Put {
+		fmt.Println(green.Render("✓"), bold.Render(id), muted.Render(p))
+	}
+	for _, p := range g.Off {
+		fmt.Println(green.Render("✓"), bold.Render(id), muted.Render(p+": magpie was out of it already"))
+	}
+	if len(g.Put) > 0 {
+		fmt.Println(muted.Render("  its plugin is gone; disconnected from magpie, back to what it had before"))
+	}
+	if g.PluginOff != "" {
+		fmt.Println(green.Render("✓"), bold.Render(g.PluginOff), muted.Render("is not on magpie: its plugin is off, and magpie put back what it had when the plugin was turned off"))
+	}
+	if err != nil {
+		return fmt.Errorf("%s's plugin is gone, and magpie couldn't put its config back: %w", id, err)
 	}
 	return nil
 }

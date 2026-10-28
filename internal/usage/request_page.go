@@ -7,11 +7,14 @@ package usage
 
 import (
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"hash"
 	"hash/maphash"
 	"io"
 	"maps"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -74,6 +77,7 @@ type packedRow struct {
 	RouteID                        int64
 	Cost, Credits                  float64
 	Status, Tries                  int32
+	Masking                        int32 // ms (Record.Masking)
 	Flags                          uint16
 }
 
@@ -111,7 +115,7 @@ type rowChunk struct {
 	// row of the period at once. 364k calls had 7300 shapes.
 	Shapes           [][rowTexts]uint32
 	shapeIDs         map[[rowTexts]uint32]uint32
-	codexActors      []string
+	codexActors      codexActors
 	codexCompactions map[int]*bool
 	codexIdentities  map[string]sessions.CodexIdentity
 	dict             map[string]uint32
@@ -222,7 +226,7 @@ func (c *rowChunk) add(r Row, msg string, order int64, failed bool) {
 		c.Bytes += int64(len(s) + 48)
 		return id
 	}
-	p := packedRow{Time: r.Time, Tokens: [6]int64{int64(r.Input), int64(r.Output), int64(r.CacheRead), int64(r.CacheWrite), int64(r.Reasoning), int64(r.CacheWrite1h)}, Millis: r.Millis, TTFT: r.TTFT, FirstText: r.FirstText, FirstReasoning: r.FirstReasoning, Sent: r.Sent, Flow: r.Flow, Own: r.Own, Retried: r.Retried, Queued: r.Queued, Order: order, RouteID: r.RouteID, Cost: r.Cost, Status: int32(r.Status), Tries: int32(r.Tries)}
+	p := packedRow{Time: r.Time, Tokens: [6]int64{int64(r.Input), int64(r.Output), int64(r.CacheRead), int64(r.CacheWrite), int64(r.Reasoning), int64(r.CacheWrite1h)}, Millis: r.Millis, TTFT: r.TTFT, FirstText: r.FirstText, FirstReasoning: r.FirstReasoning, Sent: r.Sent, Flow: r.Flow, Own: r.Own, Masking: int32(min(r.Masking, math.MaxInt32)), Retried: r.Retried, Queued: r.Queued, Order: order, RouteID: r.RouteID, Cost: r.Cost, Status: int32(r.Status), Tries: int32(r.Tries)}
 	var t [rowTexts]uint32
 	for i, s := range rowText(&r) {
 		t[i] = intern(*s)
@@ -271,25 +275,23 @@ func (c *rowChunk) add(r Row, msg string, order int64, failed bool) {
 		}
 	}
 	c.Rows = append(c.Rows, p)
-	if c.codexActors != nil || r.codexActor != "" {
-		if c.codexActors == nil {
-			c.codexActors = make([]string, len(c.Rows)-1)
-			c.Bytes += int64(len(c.codexActors)) * int64(unsafe.Sizeof(""))
+	if c.codexActors.ids != nil || r.codexActor != "" {
+		before := c.codexActors.bytes()
+		if c.codexActors.ids == nil {
+			c.codexActors.ids = make([]uint32, len(c.Rows)-1)
 		}
-		c.codexActors = append(c.codexActors, r.codexActor)
+		c.codexActors.add(r.codexActor)
+		c.Bytes += c.codexActors.bytes() - before
 	}
 	c.Count = len(c.Rows)
 	if r.Time.After(c.Latest) {
 		c.Latest = r.Time
 	}
 	c.Bytes += int64(unsafe.Sizeof(packedRow{}))
-	if c.codexActors != nil {
-		c.Bytes += int64(unsafe.Sizeof("")) + int64(len(r.codexActor))
-	}
 }
 func (c *rowChunk) row(i int) Row {
 	p := &c.Rows[i]
-	r := Row{Record: Record{RouteID: p.RouteID, Time: p.Time, Input: int(p.Tokens[0]), Output: int(p.Tokens[1]), CacheRead: int(p.Tokens[2]), CacheWrite: int(p.Tokens[3]), CacheWrite1h: int(p.Tokens[5]), Reasoning: int(p.Tokens[4]), Millis: p.Millis, TTFT: p.TTFT, FirstText: p.FirstText, FirstReasoning: p.FirstReasoning, ReasoningHidden: p.Flags&rowReasoningHidden != 0, CacheUnknown: p.Flags&rowCacheUnknown != 0, Sent: p.Sent, Flow: p.Flow, Own: p.Own, Retried: p.Retried, Queued: p.Queued, Status: int(p.Status), Tries: int(p.Tries), HandedOn: p.Flags&rowHandedOn != 0, Rejected: p.Flags&4 != 0, SessionOfficialLogin: p.Flags&8 != 0}, Cost: p.Cost, Priced: p.Flags&1 != 0, Swapped: p.Flags&2 != 0, Routed: p.Flags&32 != 0}
+	r := Row{Record: Record{RouteID: p.RouteID, Time: p.Time, Input: int(p.Tokens[0]), Output: int(p.Tokens[1]), CacheRead: int(p.Tokens[2]), CacheWrite: int(p.Tokens[3]), CacheWrite1h: int(p.Tokens[5]), Reasoning: int(p.Tokens[4]), Millis: p.Millis, TTFT: p.TTFT, FirstText: p.FirstText, FirstReasoning: p.FirstReasoning, ReasoningHidden: p.Flags&rowReasoningHidden != 0, CacheUnknown: p.Flags&rowCacheUnknown != 0, Sent: p.Sent, Flow: p.Flow, Own: p.Own, Masking: int64(p.Masking), Retried: p.Retried, Queued: p.Queued, Status: int(p.Status), Tries: int(p.Tries), HandedOn: p.Flags&rowHandedOn != 0, Rejected: p.Flags&4 != 0, SessionOfficialLogin: p.Flags&8 != 0}, Cost: p.Cost, Priced: p.Flags&1 != 0, Swapped: p.Flags&2 != 0, Routed: p.Flags&32 != 0}
 	if p.Flags&rowCredits != 0 {
 		credits := p.Credits
 		r.Credits = &credits
@@ -312,6 +314,8 @@ func (c *rowChunk) row(i int) Row {
 	}
 	if r.Swapped && p.Flags&swapKnown == 0 && (SameSpelled(r.Model, r.Served) || ServingName(r.Model, r.Served) || RelayRenamed(r.Model, r.Served)) {
 		r.Swapped = false // kept before a name spelled otherwise, a vendor's serving name or a relay's rename was the same
+	} else if r.Swapped && ListedAs(r.Provider, r.Model, r.Served) {
+		r.Swapped = false // the name the provider's list gives the model asked for
 	}
 	if r.cacheNotCounted() {
 		r.CacheUnknown = true // kept before its plugin said its vendor counts no cache
@@ -325,11 +329,7 @@ func (c *rowChunk) row(i int) Row {
 	}
 	r.Computer = c.Computer
 	if c.codexIdentities != nil {
-		actor := ""
-		if i < len(c.codexActors) {
-			actor = c.codexActors[i]
-		}
-		r = codexIdentityRow(r, actor, c.codexIdentities)
+		r = codexIdentityRow(r, c.codexActors.at(i), c.codexIdentities)
 	}
 	return r
 }
@@ -640,12 +640,11 @@ func readRequestState(now time.Time) requestState {
 		return strings.Compare(a.Path, b.Path)
 	})
 	ids, _ := json.Marshal(provider.SessionIdentities(sessions.CodexDir()))
-	codexIdentityKey, _ := json.Marshal(codexIdentities)
 	renamed := provider.UsageRenames().Key()
 	cfg := settings.Load()
 	prices, _ := json.Marshal(cfg.ModelPrices)
 	wires, _ := json.Marshal(cfg.ModelWires)
-	meta := fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s", ids, renamed, prices, wires, statKey(provider.Path()), statKey(catalog.CachePath()), clientAgentsKey())
+	meta := fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s|%s", ids, renamed, prices, wires, statKey(provider.Path()), statKey(catalog.CachePath()), clientAgentsKey(), clearedKey())
 	h := sha256.New()
 	for _, current := range provider.All() {
 		fmt.Fprintf(h, "%q:%q:%v:%t:%t:%t;", current.ID, current.Where(), current.Catalogs(), current.IsPlugin(), current.Account == nil, current.Key != "")
@@ -663,7 +662,7 @@ func readRequestState(now time.Time) requestState {
 	h.Reset()
 	snapshot := readLogSnapshot()
 	fmt.Fprint(h, meta, snapshot.version, now.In(time.Local).Format("2006-01-02 MST"))
-	h.Write(codexIdentityKey)
+	hashCodexIdentities(h, codexIdentities)
 	for _, s := range sources {
 		fmt.Fprintf(h, "%s:%d:%d;", s.Path, s.Size, s.Modified.UnixNano())
 	}
@@ -672,13 +671,51 @@ func readRequestState(now time.Time) requestState {
 		fmt.Fprintf(h, "%s:%d:%d;", s.path, s.size, s.mod.UnixNano())
 	}
 	return requestState{sources: sources, codexIdentities: codexIdentities, cfg: cfg, snapshot: snapshot, days: days, someShared: someShared,
-		root: Path() + "|" + catalog.CachePath(), meta: meta, key: fmt.Sprintf("%x", h.Sum(nil))}
+		root: requestRoot(), meta: meta, key: fmt.Sprintf("%x", h.Sum(nil))}
 }
 
-func QueryPage(p Period, f Filter, offset, limit int) RequestPage {
-	return queryPage(p, f, offset, limit, sessions.ReadCallSource)
+// hashCodexIdentities writes ids into h in the order of their keys. They
+// were json.Marshal()ed first, ~20k threads' identities encoded into a new
+// buffer of several MB on every page and effort ask.
+func hashCodexIdentities(h hash.Hash, ids map[string]sessions.CodexIdentity) {
+	keys := make([]string, 0, len(ids))
+	for k := range ids {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	b := make([]byte, 0, 32<<10)
+	for _, k := range keys {
+		id := ids[k]
+		for _, s := range [...]string{k, id.ID, id.Role, id.ParentSession, id.RootSession} {
+			b = binary.AppendUvarint(b, uint64(len(s)))
+			b = append(b, s...)
+		}
+		if len(b) > 30<<10 {
+			h.Write(b)
+			b = b[:0]
+		}
+	}
+	h.Write(b)
 }
-func queryPage(p Period, f Filter, offset, limit int, readSource func(sessions.CallSource) []sessions.Call) (page RequestPage) {
+
+// requestRoot is the logs a request state is read from: another home's
+// answer is no answer.
+func requestRoot() string { return Path() + "|" + catalog.CachePath() }
+
+func QueryPage(p Period, f Filter, offset, limit int) RequestPage {
+	return queryPageOf(p, f, offset, limit, sessions.ReadCallSource, true)
+}
+
+// queryPage is QueryPage of the session files as readSource reads them,
+// its chunks its own.
+func queryPage(p Period, f Filter, offset, limit int, readSource func(sessions.CallSource) []sessions.Call) RequestPage {
+	return queryPageOf(p, f, offset, limit, readSource, false)
+}
+
+// queryPageOf is queryPage; share says readSource is the files' own
+// reader, so a chunk another query is making of a file is waited for
+// (sharedBuild).
+func queryPageOf(p Period, f Filter, offset, limit int, readSource func(sessions.CallSource) []sessions.Call, share bool) (page RequestPage) {
 	if limit <= 0 {
 		limit = 100
 	}
@@ -739,7 +776,8 @@ func queryPage(p Period, f Filter, offset, limit int, readSource func(sessions.C
 	shared := idx
 	idx = shared.private()
 	shared.Unlock()
-	b := readRequestBlocks(idx, st, p, now, readSource)
+	b := readRequestBlocks(idx, st, p, now, readSource, share)
+	defer b.priced.release() // on a panic too: a shared block is held until let go
 	var names map[string]string
 	if someShared {
 		names = sharedNames()
@@ -791,10 +829,11 @@ func codexEffortOfIndex(st requestState, p Period, now time.Time) map[string][]s
 	memo := shared.pairs[p]
 	idx := shared.private()
 	shared.Unlock()
-	b := readRequestBlocks(idx, st, p, now, sessions.ReadCallSource)
+	b := readRequestBlocks(idx, st, p, now, sessions.ReadCallSource, true)
+	defer b.priced.release()
 	sums := effortSums{}
 	ps, next := pairRowsMemo(p, now, b.gateways, b.chunks, b.others, st.codexIdentities, memo)
-	ps.visit(func(_ timedRef, r *Row) { sums.add(r) })
+	ps.visitActors(func(r *Row) { sums.add(r) })
 	b.priced.release()
 	shared.Lock()
 	if shared.keep(idx, b.on) {
@@ -820,8 +859,10 @@ type requestBlocks struct {
 
 // readRequestBlocks reads the blocks of p at now into idx, a private copy
 // of the request index (private): a session file or another computer's
-// day is read again only when it changed since its chunk was made.
-func readRequestBlocks(idx *requestIndex, st requestState, p Period, now time.Time, readSource func(sessions.CallSource) []sessions.Call) requestBlocks {
+// day is read again only when it changed since its chunk was made. share
+// says readSource is sessions.ReadCallSource: a file another query is
+// making a chunk of now is waited for, not read beside it (sharedBuild).
+func readRequestBlocks(idx *requestIndex, st requestState, p Period, now time.Time, readSource func(sessions.CallSource) []sessions.Call, share bool) requestBlocks {
 	sources, cfg, snapshot, days := st.sources, st.cfg, st.snapshot, st.days
 	price := Pricer()
 	// Swapped's names are a few hundred pairs over thousands of files' calls,
@@ -829,18 +870,18 @@ func readRequestBlocks(idx *requestIndex, st requestState, p Period, now time.Ti
 	// reader of the session files has a pricer of its own, with its memos.
 	pricers := func() func(Record, string) Row {
 		price := Pricer()
-		swapped := map[[2]string]bool{}
+		swapped := map[[4]string]bool{}
 		return func(r Record, source string) Row {
 			sent := r.Model
 			if source == "" {
-				sent = provider.SentNameIn(cfg.ModelWires, r.Provider, r.Model, r.Effort)
+				sent = provider.SentNameIn(cfg.ModelWires, r.priceID(), r.Model, r.Effort)
 			}
 			row := Row{Record: r, Source: source, Routed: GroupRouted(sent, r.Served)}
 			if r.Served != "" {
-				k := [2]string{sent, r.Served}
+				k := [4]string{r.priceID(), r.Model, sent, r.Served}
 				s, ok := swapped[k]
 				if !ok {
-					s = Swapped(sent, r.Served)
+					s = Swapped(sent, r.Served) && !ListedAs(r.priceID(), r.Model, r.Served)
 					swapped[k] = s
 				}
 				row.Swapped = s
@@ -866,6 +907,8 @@ func readRequestBlocks(idx *requestIndex, st requestState, p Period, now time.Ti
 	var gateways []*rowChunk
 	renames := provider.UsageRenames()
 	priced := newBlockPricer(renames, cfg.ModelWires, price)
+	meta := sha256.Sum256([]byte(st.root + "|" + st.meta))
+	priced.share(meta)
 	for _, packed := range snapshot.blocks {
 		if !gatewaySince.IsZero() && packed.Latest.Before(gatewaySince) {
 			continue
@@ -874,7 +917,7 @@ func readRequestBlocks(idx *requestIndex, st requestState, p Period, now time.Ti
 			gateways = append(gateways, c)
 		}
 	}
-	if c := probeChunk(snapshot.probes, gatewaySince, renames); c != nil {
+	if c := probeChunk(snapshot.probes, gatewaySince, renames, snapshot.hosts); c != nil {
 		gateways = append(gateways, c) // listed, never counted (SourceProbe)
 	}
 	on := map[string]bool{}
@@ -905,7 +948,7 @@ func readRequestBlocks(idx *requestIndex, st requestState, p Period, now time.Ti
 	// another, they were most of a cold build's wait (#3493).
 	makeChunk := func() func(sessions.CallSource) *rowChunk {
 		priceRow := pricers()
-		return func(s sessions.CallSource) *rowChunk {
+		build := func(s sessions.CallSource) *rowChunk {
 			cs := readSource(s)
 			c := &rowChunk{Source: s, Rows: make([]packedRow, 0, len(cs))}
 			for _, call := range cs {
@@ -920,6 +963,12 @@ func readRequestBlocks(idx *requestIndex, st requestState, p Period, now time.Ti
 			c.Bytes -= int64(32 * len(c.Strings))
 			c.dict, c.shapeIDs = nil, nil // local chunks are immutable until the source changes
 			return c.pack()
+		}
+		if !share {
+			return build
+		}
+		return func(s sessions.CallSource) *rowChunk {
+			return sharedBuild(chunkBuildKey{meta, s.Path, s.Size, s.Modified.UnixNano()}, func() *rowChunk { return build(s) })
 		}
 	}
 	read := prefetchEach(sources, stale, makeChunk)
@@ -937,14 +986,15 @@ func readRequestBlocks(idx *requestIndex, st requestState, p Period, now time.Ti
 			c.serial = nextChunkSerial()
 			built++
 			builtRows += c.Count
+			c.Used = idx.tick
 			put = spill.put(c, i)
+		} else {
+			c = idx.use(c)
 		}
-		kept, next := *c, *c
-		kept.Used, next.Used = idx.tick, idx.tick
-		idx.chunks[s.Path] = &kept
-		chunks = append(chunks, &next)
+		idx.chunks[s.Path] = c
+		chunks = append(chunks, c)
 		if put {
-			spill.hand(&kept, &next)
+			spill.hand(c)
 		}
 	}
 	spill.done(func(i int) *rowChunk { return makeChunk()(sources[i]) })
@@ -967,18 +1017,19 @@ func readRequestBlocks(idx *requestIndex, st requestState, p Period, now time.Ti
 			for i, call := range d.Calls {
 				r := call.Record
 				r.Computer = ""
-				r.Provider = renames.Of(r.Provider, r.Time)
+				r.renameBy(renames)
 				c.add(priceRow(r, call.Source), "", int64(i), false)
 			}
 			c.Bytes -= int64(32 * len(c.Strings))
 			c.dict, c.shapeIDs = nil, nil
 			c = c.pack()
 			c.serial = nextChunkSerial()
+			c.Used = idx.tick
+		} else {
+			c = idx.use(c)
 		}
-		kept, next := *c, *c
-		kept.Used, next.Used = idx.tick, idx.tick
-		idx.chunks[s.path] = &kept
-		others = append(others, &next)
+		idx.chunks[s.path] = c
+		others = append(others, c)
 	}
 	for path := range idx.chunks {
 		if !on[path] {
@@ -1017,6 +1068,20 @@ func (idx *requestIndex) adopt(st requestState) {
 		idx.pages = map[pageKey]RequestPage{}
 		idx.key = st.key
 	}
+}
+
+// use is c, a chunk of idx's, as used by this read. A chunk another read
+// published is copied, since that read's page may still hold it; one this
+// read made (fromDisk) is its own. Both the map and the page take the one
+// chunk: a copy for each was 13.5 MB of the live heap after 34k sessions'
+// start (#2278).
+func (idx *requestIndex) use(c *rowChunk) *rowChunk {
+	if c.Used == idx.tick {
+		return c
+	}
+	next := *c
+	next.Used = idx.tick
+	return &next
 }
 
 // private is a copy of idx's metadata and chunk map to read into without
@@ -1521,11 +1586,7 @@ func pairRows(p Period, now time.Time, gateways, chunks, others []*rowChunk, ide
 	since, until := p.Since(now), p.Until(now)
 	matched := matchedBlocks(gateways, chunks, skip, pairs, since, true)
 	for gateway, local := range pairs {
-		actor := ""
-		if local.Index < len(local.Chunk.codexActors) {
-			actor = local.Chunk.codexActors[local.Index]
-		}
-		setCodexActor(gateway.Chunk, gateway.Index, actor)
+		setCodexActor(gateway.Chunk, gateway.Index, local.Chunk.codexActors.at(local.Index))
 		gateway.Chunk.setCodexCompaction(gateway.Index, compactions[local])
 	}
 	all := append(append(slices.Clone(gateways), chunks...), others...)
@@ -1544,6 +1605,28 @@ func (ps *pairedRows) visit(fn func(timedRef, *Row)) {
 		ps.visitChunk(&rows, c, &r, fn)
 	}
 }
+
+// visitActors is visit of the rows of the chunks a Codex thread is known
+// for some row of (codexActors), the only rows Codex's effort adds up: it
+// decoded every session file's chunk, ~90 MB of what eight Sessions polls
+// allocated, for the few that are Codex's. The rows' strings are lent
+// (lentRows), so fn clones what it keeps.
+func (ps *pairedRows) visitActors(fn func(*Row)) {
+	rows := lentRows()
+	defer rows.release()
+	var r Row
+	for _, c := range ps.all {
+		if c.codexActors.some() {
+			if visitingActors != nil {
+				visitingActors(c)
+			}
+			ps.visitChunk(&rows, c, &r, func(_ timedRef, r *Row) { fn(r) })
+		}
+	}
+}
+
+// visitingActors, in tests, is told each chunk visitActors reads.
+var visitingActors func(*rowChunk)
 
 // visitChunk is visit of c's rows alone, read through rows into r.
 func (ps *pairedRows) visitChunk(rows *chunkRows, c *rowChunk, r *Row, fn func(timedRef, *Row)) {

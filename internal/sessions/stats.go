@@ -190,10 +190,7 @@ func statsRead(days int, now time.Time, native map[string]bool) Stats {
 	identities := codexIdentitySnapshot(files)
 	taskTitles := codexSubagentTaskTitles(files)
 	if native != nil {
-		groups := map[string][]file{}
-		for _, f := range files {
-			groups[f.key] = append(groups[f.key], f)
-		}
+		groups := byKey(files, nil)
 		price, titles := pricer(), codexTitleOf()
 		for _, fs := range groups {
 			// as List: a session nothing was said in is not listed
@@ -202,9 +199,14 @@ func statsRead(days int, now time.Time, native map[string]bool) Stats {
 			}
 		}
 	}
+	// a copy of a conversation is counted in the session it is kept in
+	// (ccCopies): its subagents' files, and what its own file holds that
+	// the keeper's doesn't (ccCopyStates), not the messages both hold
+	copies := ccCopies(files)
+	copied := ccCopyStates(files, copies)
 	var want []file
 	for _, f := range files {
-		if !f.mod.Before(since) {
+		if !f.mod.Before(since) && (copies[f.key] == "" || copied[f.path] != nil) {
 			want = append(want, f)
 		}
 	}
@@ -242,6 +244,9 @@ func statsRead(days int, now time.Time, native map[string]bool) Stats {
 	shares := map[string]*share{}
 	for _, f := range want {
 		st := cache[f.path]
+		if keeper := copies[f.key]; keeper != "" {
+			st, f.key = copied[f.path], keeper
+		}
 		if st == nil {
 			continue
 		}
@@ -375,13 +380,11 @@ func statsRead(days int, now time.Time, native map[string]bool) Stats {
 		}
 	}
 
-	groups := map[string][]file{}
-	for _, f := range files {
-		if shares[f.key] != nil {
-			groups[f.key] = append(groups[f.key], f)
-		}
-	}
+	groups := byKey(files, func(f *file) bool { return shares[f.key] != nil })
 	first, _ := time.ParseInLocation(time.DateOnly, out.From, time.Local)
+	// made to size: grown by append, 34k sessions' list held a quarter
+	// more than its rows, and every copy it was grown through (#2278)
+	out.Sessions = make([]Summary, 0, len(shares))
 	for key, sh := range shares {
 		if len(sh.dates) == 0 {
 			continue
@@ -441,6 +444,7 @@ func statsRead(days int, now time.Time, native map[string]bool) Stats {
 		return a.Key < b.Key
 	})
 	// keys after the sort, so they name the sessions in the order they are in
+	out.Keys = make([]string, 0, len(out.Sessions))
 	for _, s := range out.Sessions {
 		out.Keys = append(out.Keys, s.Key)
 	}

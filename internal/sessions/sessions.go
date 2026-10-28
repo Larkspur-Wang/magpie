@@ -152,6 +152,9 @@ type Session struct {
 	// Convs are the ids magpie's gateway keys the session's requests by
 	// when they carry no session id of their own (dshConvs)
 	Convs []string `json:"-"`
+	// Copies are the ids of the sessions that are copies of its
+	// conversation, not listed apart from it (ccCopies)
+	Copies []string `json:"-"`
 }
 
 // PriceOf is the effective price of a model as a session names it, at the
@@ -209,6 +212,14 @@ type state struct {
 	MsgModel string `json:"msg_model,omitempty"`
 	MsgUse   Tokens `json:"msg_use"`
 	MsgDay   string `json:"msg_day,omitempty"`
+	// Claude Code: the uuids of the first and the last message of the
+	// file's own conversation (ccLink)
+	Root string `json:"root,omitempty"`
+	Leaf string `json:"leaf,omitempty"`
+	// Claude Code: the uuids of the summaries its compactions (/compact,
+	// /rewind's summarize) left in the file. A copy made after one starts
+	// with that summary, so its Root is one of these (ccCopies).
+	Compacts []string `json:"compacts,omitempty"`
 	// Codex: the model in use, and its running total (input with cache) last seen
 	Model string  `json:"model,omitempty"`
 	Total *Tokens `json:"total,omitempty"`
@@ -340,6 +351,7 @@ func (s *state) clone() *state {
 	c.Codex = s.Codex.clone()
 	c.Claude = s.Claude.clone()
 	c.Models = slices.Clone(s.Models)
+	c.Compacts = slices.Clone(s.Compacts)
 	if s.Total != nil {
 		t := *s.Total
 		c.Total = &t
@@ -362,14 +374,26 @@ func (s *state) clone() *state {
 	return &c
 }
 
-// file is one session file found on disk.
+// file is one session file found on disk. What only some agents' files
+// have is in more, so a listing of every rollout copies 96 bytes a file,
+// not 232: a Sessions poll copied every agent's list of ~20k files five
+// or six times over, ~50 MB a poll.
 type file struct {
-	agent string
-	key   string // agent:session id — a session may span files
-	path  string
-	main  bool // the session's own file, not a subagent's
-	size  int64
-	mod   time.Time
+	agent    string
+	key      string // agent:session id — a session may span files
+	path     string
+	size     int64
+	mod      time.Time
+	main     bool // the session's own file, not a subagent's
+	readOnly bool
+	// cold: the WSL distro the file is in isn't running, and the file, as
+	// last listed, is not to be opened (that would start the distro)
+	cold bool
+	more *fileMore // nil for a file with none of it; shared by copies
+}
+
+// fileMore is what a file of some agents has besides.
+type fileMore struct {
 	// OpenCode and ZCode: the session, and where it is kept; parent is
 	// the session that started it, "" for one the user did
 	sid    string
@@ -384,14 +408,54 @@ type file struct {
 	alma *almaStore
 	rev  string
 	// agy: what conversation_summaries.db says of the conversation
-	agy      *agySummary
-	readOnly bool
-	editor   *cursorEditorMeta
-	// wsl: the WSL distro whose home it is in; cold: that distro isn't
-	// running, and the file, as last listed, is not to be opened (that
-	// would start the distro)
-	wsl  string
-	cold bool
+	agy    *agySummary
+	editor *cursorEditorMeta
+	// wsl: the WSL distro whose home it is in
+	wsl string
+}
+
+// m is what more holds, or none of it. It is a copy: a write goes through w.
+func (f file) m() fileMore {
+	if f.more == nil {
+		return fileMore{}
+	}
+	return *f.more
+}
+
+// w is f's own more to write: copies of f share it, so it is copied first.
+func (f *file) w() *fileMore {
+	m := f.m()
+	f.more = &m
+	return f.more
+}
+
+// byKey groups the files keep takes by session, each group in the files'
+// order. The groups are cut from one copy of the kept files rather than
+// grown an append at a time: a file is a few hundred bytes, and a Sessions
+// poll grouped every one of ~16k files three times, ~150 MB in eight polls.
+// A nil keep takes every file.
+func byKey(files []file, keep func(*file) bool) map[string][]file {
+	count := map[string]int{}
+	n := 0
+	for i := range files {
+		if keep == nil || keep(&files[i]) {
+			count[files[i].key]++
+			n++
+		}
+	}
+	kept := make([]file, n)
+	groups := make(map[string][]file, len(count))
+	at := 0
+	for k, c := range count {
+		groups[k] = kept[at : at : at+c]
+		at += c
+	}
+	for i := range files {
+		if f := &files[i]; keep == nil || keep(f) {
+			groups[f.key] = append(groups[f.key], *f)
+		}
+	}
+	return groups
 }
 
 // ClaudeDir is Claude Code's folder: $CLAUDE_CONFIG_DIR, else ~/.claude.
@@ -417,7 +481,7 @@ func stat(f *file) bool {
 // is read in one listing where the system has one (dirent.Stats), and the
 // rest are stat()ed on a few goroutines.
 func statFiles(files []file, follow bool) []file {
-	dirs := map[string]map[string]dirent.Stat{}
+	dirs := map[string]dirent.Listing{}
 	var order []string
 	for _, f := range files {
 		d := filepath.Dir(f.path)
@@ -426,7 +490,7 @@ func statFiles(files []file, follow bool) []file {
 			order = append(order, d)
 		}
 	}
-	listed := make([]map[string]dirent.Stat, len(order))
+	listed := make([]dirent.Listing, len(order))
 	parallel(len(order), 8, func(i int) {
 		if s, ok := dirent.Stats(order[i]); ok {
 			listed[i] = s
@@ -439,7 +503,7 @@ func statFiles(files []file, follow bool) []file {
 	parallel(len(files), 256, func(i int) {
 		f := &files[i]
 		if in := dirs[filepath.Dir(f.path)]; in != nil {
-			s, there := in[filepath.Base(f.path)]
+			s, there := in.Get(filepath.Base(f.path))
 			if !there || s.Mode != 0 && (s.Mode != fs.ModeSymlink || !follow) {
 				return
 			}
@@ -677,7 +741,13 @@ func forgetWarmListing() {
 func listCodexFiles() []file {
 	var out []file
 	for _, dir := range CodexDirs() {
-		out = append(out, codexFilesIn(dir)...)
+		// one folder's listing is the whole of it: copied, it was ~65 MB
+		// of what eight Sessions polls allocated
+		if out == nil {
+			out = codexFilesIn(dir)
+		} else {
+			out = append(out, codexFilesIn(dir)...)
+		}
 	}
 	return distinctPaths(out)
 }
@@ -718,7 +788,11 @@ func codexFilesIn(dir string) []file {
 	for _, folder := range []string{"sessions", "archived_sessions"} {
 		root := filepath.Join(dir, folder)
 		if listed, ok := listedRollouts(root); ok {
-			out = append(out, listed...)
+			if out == nil {
+				out = listed
+			} else {
+				out = append(out, listed...)
+			}
 			continue
 		}
 		var found []file
@@ -752,6 +826,9 @@ func codexFilesIn(dir string) []file {
 	return distinctCodexFiles(kept)
 }
 
+// rolloutsListed is how many rollouts each root's last listing found.
+var rolloutsListed sync.Map
+
 // listedRollouts are the rollouts under root, in walkLinked's order and
 // with their sizes and times, read with one listing a folder
 // (dirent.Stats) rather than a listing and an lstat() a file: Codex's day
@@ -759,6 +836,16 @@ func codexFilesIn(dir string) []file {
 // Sessions poll. ok is false when a folder couldn't be read so, and
 // walkLinked and statFiles read root instead.
 func listedRollouts(root string) (out []file, ok bool) {
+	// sized as the last listing of root was: grown a rollout at a time,
+	// ~20k of them allocated five times their size on every poll
+	if n, ok := rolloutsListed.Load(root); ok {
+		out = make([]file, 0, n.(int)+n.(int)/16)
+	}
+	defer func() {
+		if ok {
+			rolloutsListed.Store(root, len(out))
+		}
+	}()
 	walk := root
 	if fi, err := os.Lstat(root); err != nil {
 		return nil, false
@@ -775,8 +862,8 @@ func listedRollouts(root string) (out []file, ok bool) {
 		if !ok {
 			return false
 		}
-		for _, name := range slices.Sorted(maps.Keys(entries)) {
-			e := entries[name]
+		for _, e := range entries {
+			name := e.Name
 			switch e.Mode {
 			case fs.ModeDir:
 				if !in(filepath.Join(real, name), filepath.Join(shown, name)) {
@@ -848,7 +935,11 @@ func CachePath() string { return filepath.Join(filepath.Dir(catalog.CachePath())
 // 20: Codex's source and direct parent thread identity.
 // 21: Codex subagent nicknames and parent spawn task names.
 // 22: dsh's gateway conversation ids (Convs).
-const cacheVersion = 22
+// 23: Claude Code's first and last message uuids (Root, Leaf).
+// 24: Claude Code's compact summaries' uuids (Compacts).
+// 25: the skills Codex calls up by reading their SKILL.md.
+// 26: Grok Build's tool calls and skills.
+const cacheVersion = 26
 
 type cacheFile struct {
 	Version int               `json:"version"`
@@ -885,7 +976,8 @@ func loadCache() {
 // for a long history) takes a second or more, so it is done behind the
 // request: the parses in the cache are never changed once put there (a new
 // parse starts from a clone), so a copy of the map is a snapshot; saves in a
-// row are folded into the latest.
+// row are folded into the latest, and one is written saveGap after the
+// last at the soonest.
 func saveCache() {
 	snap := save{cacheFile{Version: cacheVersion, Zone: zone(), Files: maps.Clone(cache)}, CachePath()}
 	saving.Lock()
@@ -898,25 +990,57 @@ func saveCache() {
 	go func() {
 		for {
 			saving.Lock()
+			wait := saveGap - time.Since(saving.wrote)
+			if saving.hurry {
+				wait = 0
+			}
+			saving.Unlock()
+			if wait > 0 {
+				select {
+				case <-time.After(wait):
+				case <-saveNow:
+				}
+			}
+			saving.Lock()
 			f := saving.next
 			saving.next = nil
 			if f == nil {
-				saving.running = false
+				saving.running, saving.hurry = false, false
+				select { // a Saved's wake-up, unused, cuts no later gap
+				case <-saveNow:
+				default:
+				}
 				saving.Broadcast()
 				saving.Unlock()
 				return
 			}
 			saving.Unlock()
 			writeCache(f)
+			saving.Lock()
+			saving.wrote = time.Now()
+			saving.Unlock()
 		}
 	}()
 }
+
+// saveGap is how long a save waits after the last one written. A Sessions
+// or Usage page polls every 15 s, and a live session changes its file
+// between any two, so each poll wrote the whole index again: tens of MB
+// for a long history, ~20 MB allocated to encode it each time. The index
+// only spares the next start a read; what a save not yet written misses is
+// read again then. Saved does not wait it out.
+var saveGap = time.Minute
+
+// saveNow wakes a save waiting out saveGap once saving.hurry is set.
+var saveNow = make(chan struct{}, 1)
 
 var saving struct {
 	sync.Mutex
 	*sync.Cond
 	running bool
 	next    *save
+	wrote   time.Time // when the last save was written
+	hurry   bool      // Saved is waiting: no save waits out saveGap
 }
 
 type save struct {
@@ -930,9 +1054,16 @@ func init() { saving.Cond = sync.NewCond(&saving.Mutex) }
 // it on disk.
 func Saved() { saved() }
 
-// saved waits for the saves under way.
+// saved waits for the saves under way, written without their saveGap.
 func saved() {
 	saving.Lock()
+	if saving.running {
+		saving.hurry = true
+		select {
+		case saveNow <- struct{}{}:
+		default:
+		}
+	}
 	for saving.running {
 		saving.Wait()
 	}
@@ -977,7 +1108,7 @@ func refresh(want, all []file) {
 		if f.cold {
 			continue // in a stopped WSL distro: what was read of it stands
 		}
-		if s := cache[f.path]; s == nil || s.Size != f.size || s.Mod != f.mod.UnixNano() || (f.agent == "hermes" && (f.hermes == nil || f.rev == "" || s.DBRevision != f.rev)) || ((f.agent == "alma" || f.agent == "cursor" || f.agent == "agy") && s.DBRevision != f.rev) {
+		if s := cache[f.path]; s == nil || s.Size != f.size || s.Mod != f.mod.UnixNano() || (f.agent == "hermes" && (f.m().hermes == nil || f.m().rev == "" || s.DBRevision != f.m().rev)) || ((f.agent == "alma" || f.agent == "cursor" || f.agent == "agy") && s.DBRevision != f.m().rev) {
 			if parsing[f.path] != nil {
 				// a refresh is reading it, another or this one (a path
 				// listed twice): its last parse stands until that one is
@@ -1286,10 +1417,9 @@ func listSessions(limit int) []Session {
 
 	defer useDBs()()
 	files := allFiles()
-	groups := map[string][]file{}
+	groups := byKey(files, nil)
 	latest := map[string]time.Time{}
 	for _, f := range files {
-		groups[f.key] = append(groups[f.key], f)
 		if f.mod.After(latest[f.key]) {
 			latest[f.key] = f.mod
 		}
@@ -1314,10 +1444,17 @@ func listSessions(limit int) []Session {
 	identities := codexIdentitySnapshot(files)
 	taskTitles := codexSubagentTaskTitles(files)
 
+	copies := ccCopies(files)
+	copyIDs := copiesByKeeper(copies, groups)
+
 	price, titles := pricer(), codexTitleOf()
 	out := []Session{}
 	for _, k := range keys {
+		if copies[k] != "" {
+			continue
+		}
 		if s, ok := assemble(groups[k], price, titles); ok {
+			s.Copies = copyIDs[k]
 			setSessionCodexIdentity(&s, identities)
 			setSessionCodexTaskTitle(&s, taskTitles)
 			out = append(out, s)
@@ -1377,7 +1514,7 @@ func assemble(fs []file, price func(string) *catalog.Price, codexTitle func(stri
 // subagent's file again (3.5 GB of a live magpie's 6.3 GB of scans).
 func assembleListed(fs []file, price func(string) *catalog.Price, codexTitle func(string) string) (Session, bool) {
 	sortSessionFiles(fs)
-	s := Session{Agent: fs[0].agent, Path: fs[0].path, Models: []Model{}, WSL: fs[0].wsl}
+	s := Session{Agent: fs[0].agent, Path: fs[0].path, Models: []Model{}, WSL: fs[0].m().wsl}
 	for _, f := range fs {
 		s.ReadOnly = s.ReadOnly || f.readOnly
 	}
@@ -2255,11 +2392,10 @@ func Titles(keys []string) map[string]string {
 	loadCache()
 	defer useDBs()()
 	files := allFiles()
-	groups := map[string][]file{}
+	groups := byKey(files, func(f *file) bool { return want[f.key] })
 	var fs []file
 	for _, f := range files {
 		if want[f.key] {
-			groups[f.key] = append(groups[f.key], f)
 			fs = append(fs, f)
 		}
 	}

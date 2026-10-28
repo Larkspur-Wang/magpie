@@ -57,7 +57,10 @@ function fixture(lang, theme, events, options = {}) {
   return async (route) => {
     const req = route.request(), url = new URL(req.url());
     const json = (data) => route.fulfill({ json: data });
-    if (url.pathname === "/boot.js") return route.fulfill({ contentType: "text/javascript", body: `window.bootPrefs = ${JSON.stringify({ lang, theme, web: !!options.web })};` });
+    if (url.pathname === "/boot.js") return route.fulfill({ contentType: "text/javascript", body: `window.bootPrefs = ${JSON.stringify({ lang, theme, web: !!options.web,
+      // with options.publicURL, where this process's gateway listens, as
+      // magpie's boot.js says it, MAGPIE_PUBLIC_URL with it while shared
+      ...(options.publicURL ? { sideGateway: { url: "http://127.0.0.1:3999", running: true, boot: true, ...publicURL() } } : {}) })};` });
     if (url.pathname === "/wails/runtime.js") return route.fulfill({ contentType: "text/javascript", body: "export const Window = {};" });
     if (url.pathname === "/favicon.ico") return route.fulfill({ status: 204 });
     if (url.pathname === "/api/state") return json({ agents: [], profiles: [], settings: { lang, theme } });
@@ -175,9 +178,14 @@ function fixture(lang, theme, events, options = {}) {
     await route.fulfill({ body: await fs.readFile(file), contentType: { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml", ".png": "image/png" }[path.extname(file)] });
   };
 }
+// keyAction picks Rotate key or Remove from a key's … menu
+async function keyAction(page, row, label) {
+  await row.locator(".gw-key-more").click();
+  await page.locator(".row-menu").getByRole("menuitem", { name: label, exact: true }).click();
+}
 async function confirmKeyAction(page, row, label) {
-  await row.getByRole("button", { name: label, exact: true }).click();
+  await keyAction(page, row, label);
   await page.locator("#modal").getByRole("button", { name: label, exact: true }).click();
   await page.locator("#modal").waitFor({ state: "hidden" });
 }
-module.exports = { fixture, confirmKeyAction };
+module.exports = { fixture, keyAction, confirmKeyAction };

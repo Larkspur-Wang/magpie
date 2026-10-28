@@ -126,7 +126,12 @@ type Record struct {
 	// sending it the body. #1532: a vendor that held a try ~100 s and
 	// said 503 read as 104 s "In magpie". 0 in a record written before
 	// they were, where Sent is all that is known.
-	Own     int64 `json:"own_ms,omitempty"`
+	Own int64 `json:"own_ms,omitempty"`
+	// Masking: the ms of Own that went on masking the request (Settings
+	// → Privacy: the rules, and the local model with its wait for a
+	// turn); 0 where nothing was masked, or in a record from before it
+	// was kept.
+	Masking int64 `json:"masking_ms,omitempty"`
 	Retried int64 `json:"retried_ms,omitempty"`
 	Queued  int64 `json:"queued_ms,omitempty"`
 	// Flow: the ms the reply's content took to come, from where its speed
@@ -220,6 +225,30 @@ type Record struct {
 	// export with bodies on, #538) and never written to usage.jsonl.
 	BodyIn  string `json:"-"`
 	BodyOut string `json:"-"`
+	// pricedAs is the provider the call is priced as when it is shown
+	// under another: a deleted provider's merged into one on the Usage
+	// page, which costs what it did (provider.Renames.Both). Never kept.
+	pricedAs string
+}
+
+// renameBy has r's provider the one its calls are shown under now
+// (Renames.Of), and keeps the one it is priced as beside it when they
+// differ.
+func (r *Record) renameBy(rn provider.Renames) {
+	shown, own := rn.Both(r.Provider, r.Time)
+	r.Provider, r.pricedAs = shown, ""
+	if own != shown {
+		r.pricedAs = own
+	}
+}
+
+// priceID is the provider r is priced as: its own, not one it is shown
+// under after a merge (renameBy).
+func (r Record) priceID() string {
+	if r.pricedAs != "" {
+		return r.pricedAs
+	}
+	return r.Provider
 }
 
 // Path is the log file: ~/.config/magpie/usage.jsonl (XDG-aware).
@@ -240,6 +269,7 @@ func Append(r Record) {
 	if !r.IsProbe() { // magpie's own test is no call to export
 		observeLedger(r)
 	}
+	defer codexUsedNew(r)
 	b, err := json.Marshal(r)
 	if err != nil {
 		return
@@ -921,6 +951,10 @@ func summarizeFrom(p Period, now time.Time, first time.Time, historicalKeys map[
 		}
 	}
 	historicalKeys = normalizedKeys
+	// the user's clears (cleared.go): a call cleared is in no figure, and a
+	// clear of everything starts the timeline again
+	cleared := readCleared()
+	first = cleared.clearedSince(first)
 	// a picked range's own days alone: its chart can start on the Monday
 	// before its first, and it ends before now (#1492)
 	from, until := p.Since(now), p.Until(now)
@@ -929,7 +963,10 @@ func summarizeFrom(p Period, now time.Time, first time.Time, historicalKeys map[
 			if r.Time.Before(from) || after(until, r.Time) {
 				return
 			}
-			r.Provider = renamed.Of(r.Provider, r.Time)
+			r.renameBy(renamed)
+			if cleared.hides(&r) {
+				return
+			}
 			fn(r)
 		})
 	}

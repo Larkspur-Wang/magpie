@@ -7,6 +7,11 @@ with no binding generator and no bundler. `magpie web` serves the same page
 to a browser for a machine with no desktop. Package `internal/gui` hosts all
 three.
 
+The Mirasim fork keeps its launcher/provider switches in the shared Settings
+surface. At upstream v0.1.1906 these hooks add 443 bytes to `app.js`; the fork's
+core-script test adds exactly that fixed allowance to both upstream budgets,
+without changing their existing headroom. Translations remain excluded.
+
 ## Responsibilities and sources of truth
 
 | Part | Responsibility | Source |

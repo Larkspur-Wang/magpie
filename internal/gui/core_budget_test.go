@@ -19,6 +19,10 @@ const (
 	coreScriptBudget = 1_528_076 // every core script: 1,358,034 after Usage left; 1,380,003 with them; 1,405,937 with the fold; 1,426,102 with 10-16's core work (the GitHub list loading, the move to plugins, Settings › Long conversations), plus 1.5% (#2612); 1,447,368 with loadBack, the window's one state read per return, which every page needs and so is the core's own (1,446,845 before it, 155 bytes under), plus 1.5%; OpenCode Zen's card saying OpenCode tells no key its balance adds ~390 bytes inside it; 1,472,589 with the dialog that grows out of its row and the agents' own settings in their rows, on main's 10-20 core work (the Providers page's last list, the Routing trace's names), plus 1.5% (10-20); 1,506,192 with Settings › Privacy's record of what was masked, plus 1.5%; 1,529,393 with the Intent classifier timeout row (#2934), with no room added; 1,529,495 with the editor's partner link host, with no room added; 1,529,844 with Check in now's press summary (#3326), with no room added; 1,530,689 with the new partner tile's dot, with no room added; 1,535,084 with the sidebar's spring, with no room added; 1,549,478 with the context window card's map (tiles by tokens, the default look, the block grid a switch away) and its text view showing an inline image, in context.js, which the Routing page draws as well as Usage, so the core's own, with no room added (10-24); 1,550,768 with a usage card's refresh opening after its text (#840's card, which the tray panel draws too), the Add key spinner, and a dialog kept centred while its content comes in, with no room added (10-24); 1,524,789 with what masking did moved out to Insights › Masking, lowered to it; 1,528,525 with Codex's one subagent model, with no room added (10-24); 1,528,972 with the Image generation MCP server row (JonahFu on X), with no room added (10-25); 1,529,542 with the limit-rest row (zoecats), with no room added (10-25); 1,529,837 with Keep a key's form (Charles Cao on X), with no room added (10-25); 1,530,050 with no Codex squares beside its named settings rows (the owner), with no room added (10-25); 1,530,631 with a plugin's page growing to its README on the dialog's spring instead of in one jump (the owner), the Plugins page's, in plugins.js, with no room added (10-25); 1,533,445 with the context map counting its tokens on as a live request grows, a tile pointed at keeping its tip, a tool's gathered results saying how many and the small files their folder (the owner, after flohoeller's map on X), in context.js, which the Routing page draws as well as Usage, and the 4 bytes 84c50f032 added to app.js (Settings' Version row) without a raise, with no room added (10-25); 1,534,312 with the tray panel's last allowances drawn at once (#3160, #3134), with no room added (10-25); 1,537,016 with many releases' notes merged into one list by kind (the owner), in app.js, with no room added (10-25); 1,542,244 with a plugin's README loading under magpie's bird bouncing down its lines instead of pulsing bars (the owner), the Plugins page's, in plugins.js, with no room added (10-26); 1,542,418 with a page plugin's sidebar tab coming and going as it is installed, switched on or off, or removed, instead of on the Plugins page's next load (the owner), in plugins.js, with no room added (10-26); 1,537,645 with Settings › Observability moved out to plugins/otel, lowered to it (10-26); 1,537,673 with a used window with no reset not "Not used yet" (windy on Discord), and back to 1,537,645 with Settings' model pickers sharing modelOpt (10-26); 1,541,967 with every slow page's skeletons getting magpie's bird (skelBird, the owner), in app.js, the README's bird sharing its drawing and styles, with no room added (10-26); 1,526,251 with Settings' gateway rows moved out to plugins/gateway/settings.js, lowered to it (10-27); 1,526,391 with Test models naming the first failed model and its error (ysm119 on Discord), in app.js, with no room added (10-27); 1,526,556 with About's Website row (the owner), in app.js, with no room added (10-27); 1,526,500 with a pool's cap ticks (plugins#349), in app.js, with no room added (10-28); 1,527,245 with About's Open-source licenses row and dialog (the owner), in app.js, with no room added (10-28); 1,528,076 with the Partners heading's light (the owner), in app.js, with no room added (10-28)
 )
 
+// The fork's Mirasim launcher/provider controls add 443 bytes to upstream's
+// app.js. Keep the upstream headroom unchanged; i18n.js is excluded already.
+const mirasimScriptBudget = 443
+
 func TestCoreScriptBudget(t *testing.T) {
 	page, err := os.ReadFile("assets/index.html")
 	if err != nil {
@@ -37,8 +41,8 @@ func TestCoreScriptBudget(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if name == "app.js" && len(b) > appScriptBudget {
-			t.Errorf("app.js is %d bytes, over its budget of %d: put the page's code in its plugin, or raise the budget and say why", len(b), appScriptBudget)
+		if name == "app.js" && len(b) > appScriptBudget+mirasimScriptBudget {
+			t.Errorf("app.js is %d bytes, over its budget of %d: put the page's code in its plugin, or raise the budget and say why", len(b), appScriptBudget+mirasimScriptBudget)
 		}
 		total += len(b)
 		n++
@@ -46,7 +50,7 @@ func TestCoreScriptBudget(t *testing.T) {
 	if n < 5 {
 		t.Fatalf("found only %d core scripts in index.html", n)
 	}
-	if total > coreScriptBudget {
-		t.Errorf("the core's scripts are %d bytes, over their budget of %d: put the page's code in its plugin, or raise the budget and say why", total, coreScriptBudget)
+	if total > coreScriptBudget+mirasimScriptBudget {
+		t.Errorf("the core's scripts are %d bytes, over their budget of %d: put the page's code in its plugin, or raise the budget and say why", total, coreScriptBudget+mirasimScriptBudget)
 	}
 }

@@ -92,3 +92,35 @@ Credential-bearing rollback backups remain private and are not in Git.
 
 Verdict: source merge candidate prepared; runtime removal verified;
 release/install NOT accepted.
+
+## Subsequent User-Requested Installation
+
+Later on 2026-10-28 the user explicitly requested replacing the running
+app after being told about the test failures above. This supersedes the
+earlier decision not to install, not the recorded test results.
+
+- Rebuilt the custom edition from exact source `e2aa30a2` as
+  `mirasim-v0.1.1906+e2aa30a2`; verified its bundle ID, local signature and
+  installed binary hash. No official binary was used.
+- Backed up active configuration and retained the old app outside
+  `/Applications`, then restarted the existing LaunchAgent. Gateway
+  ownership changed from PID 18300 to PID 34250 on port 3425.
+- Post-install native Mirasim verification passed Chat Completions,
+  Responses, Anthropic generation, a random-marker tool roundtrip, token
+  accounting, SSE and invalid-model rejection.
+- Both `group/gpt-6-astra` and `group/gpt-sol` passed real Responses
+  generation, random-marker tool roundtrips and SSE. Routing records
+  were checked for Mirasim GPT first/only, not merely successful fallback.
+- Direct short requests to Mirasim Claude, Mirasim GPT, Codex and Cohub
+  passed. Antigravity also passed this time, reporting served model
+  `gemini-3.8-flash-n`; the earlier location error was not reproduced on
+  this request. No proxy/account setting was changed to bypass it.
+- Nine explicit groups, five remaining account identities and WorkBuddy's
+  off state were preserved. Removed Cursor/SuperGrok/group endpoints
+  still returned 404. No expired subscription was re-enabled.
+
+The source product branch may now fast-forward to this documented install
+record at the user's request. This is an installed custom build with
+known outstanding full-suite issues, not a claim that the native window
+test, the full race suite or the browser matrix passed. No release tag is
+created while those gates remain unresolved.
